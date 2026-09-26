@@ -88,7 +88,10 @@ class RawStep(BaseModel):
 
 
 class RawLocalPlan(BaseModel):
-    steps: list[RawStep] = Field(min_length=1)
+    # No min_length: a robot with no relevant action for this task (e.g. a fixed kitchen robot
+    # for a "clear the living room" task) should be able to legitimately return zero steps
+    # rather than being forced to invent a LOCAL/NEED/PASS step just to satisfy a schema minimum.
+    steps: list[RawStep] = Field(default_factory=list)
 
 
 class Step(RawStep):
