@@ -13,6 +13,15 @@ Prompt design notes (informed by the KCC 2-agent pilot, p2p_phase.py phase2_loca
   ends up unmatched even though the work actually got done. The prompt below calls this out
   explicitly and requires a visible PASS/task step whenever this happens - "doing it" is not
   enough, the robot must also *announce* it as PASS so it can be matched.
+- Second most common failure mode: a robot volunteers for one need but decomposes its own
+  execution into many small PASS steps (one per object it happens to move) instead of one
+  PASS step for the need itself. Since Auction matching is 1:1, only one of those PASS steps
+  can ever be used - the rest are silently dropped, and work that was actually planned
+  disappears from the final joint plan without any error being raised.
+- Third failure mode: a PASS step phrased as a request ("Request agent_2 to move the...")
+  has the direction backwards - it should be a NEED. Left as PASS it can never validly match
+  anything, so the real request silently disappears. `_fix_reversed_handoffs` catches this
+  in code after parsing, since prompting alone did not reliably prevent it.
 - Every rule is phrased in terms of CAPABILITY, not just "if you can" - because a plan that
   ignores capability limits produces steps the Graph's rule checks (or physical execution)
   would reject anyway.
@@ -20,6 +29,7 @@ Prompt design notes (informed by the KCC 2-agent pilot, p2p_phase.py phase2_loca
 from __future__ import annotations
 
 import json
+import re
 
 from runtime import Agent
 from schemas import AgentInput, LocalPlan, Offer, RawLocalPlan
@@ -71,6 +81,16 @@ CRITICAL RULE - visibility of help you give:
   Only volunteer (PASS) for something your CAPABILITY actually allows - do not offer to move heavy
   furniture if your capability says you cannot lift heavy objects, for example.
 
+CRITICAL RULE - one PASS per need, not one per object:
+  If one robot's need is a single task (e.g. "clear space", "move heavy furniture") and satisfying
+  it takes several of your own actions (moving a table, then chairs, then a sofa), write ONE PASS/task
+  step for that need - not one PASS step per object. Put the individual actions in your own LOCAL
+  steps (or in the one PASS step's `action` text, summarized), and let the single PASS step be what
+  answers that robot's need, with `target` set to them. Matching is one-to-one: a need can only be
+  answered by one PASS step, so splitting your work into many small PASS steps for the same need
+  means only one of them can ever match and the rest are silently dropped - the work looks like it
+  never happened even though you planned to do it.
+
 Other rules:
 - Plan only what you can do with your own capability. If the task needs something you cannot do, add a NEED step instead of pretending.
 - Use only objects visible in your images or stated in your HIDDEN INFO. Never invent objects.
@@ -97,6 +117,23 @@ def build_local_plan_user(inp: AgentInput, own_offer: Offer, others: dict[str, O
     )
 
 
+_REQUEST_VERBS = re.compile(r"^(request|ask)\b", re.IGNORECASE)
+
+
+def _fix_reversed_handoffs(plan: LocalPlan) -> list[str]:
+    """A PASS step means 'I will do this for you'. If its action instead reads as a request
+    ('Request agent_2 to move the...', 'Ask agent_3 to...'), the model has the direction
+    backwards - it is actually a NEED, and left as PASS it can never validly match anything
+    (nobody asked the sender to do it), so the real request silently disappears from the plan.
+    Flip it in place; `kind`/`item` stay valid since a task-need needs exactly the same fields."""
+    fixed = []
+    for s in plan.steps:
+        if s.type == "PASS" and _REQUEST_VERBS.match(s.action.strip()):
+            s.type = "NEED"
+            fixed.append(s.id)
+    return fixed
+
+
 async def make_local_plan(agent: Agent, known_agents: set[str]) -> LocalPlan:
     assert agent.offer is not None, "make_offer() must run first"
     agent.receive()
@@ -106,6 +143,13 @@ async def make_local_plan(agent: Agent, known_agents: set[str]) -> LocalPlan:
         return LocalPlan.from_raw(agent.id, RawLocalPlan.model_validate(raw), known_agents)
 
     agent.plan = await agent.ask("plan", LOCAL_PLAN_SYSTEM, user, parse, banner_label="LOCAL PLAN RAW")
+
+    reversed_ids = _fix_reversed_handoffs(agent.plan)
+    if reversed_ids:
+        agent.log.log("plan", agent.id, "reversed_pass_fixed", steps=reversed_ids)
+        if agent.verbose:
+            print(f"  [PLAN FIX] {agent.id}: PASS phrased as a request, changed to NEED: {reversed_ids}")
+
     n_pass = sum(1 for s in agent.plan.steps if s.type == "PASS")
     n_need = sum(1 for s in agent.plan.steps if s.type == "NEED")
     if agent.verbose:
