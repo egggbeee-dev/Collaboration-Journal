@@ -12,6 +12,9 @@ Prompt design notes (informed by the KCC 2-agent pilot, p2p_phase.py phase1_offe
   abstract/state word ("space", "surface", "confirmation", "status", ...) is not something a
   robot can physically hand to another robot, and letting it through just wastes an Auction
   candidate slot that will never validly match.
+- needs is filtered post-hoc by task-overlap: a need that just restates the shared TASK
+  ("clear space in the living room" when the task says "clear the space") is not a specific
+  need and would only produce near-duplicate needs across robots that the 1:1 Auction can't merge.
 - The system prompt repeats "based on your CAPABILITY" at each rule, not just once at the top,
   because a single mention at the top of a long prompt is easy for the model to drop by the
   time it reaches can_provide/needs.
@@ -39,6 +42,23 @@ def _keywords(text: str) -> set[str]:
 def _is_passable(item: str) -> bool:
     """A can_provide entry must name a physical object, not a state or a place."""
     return not bool(_keywords(item) & NON_PASSABLE_KW)
+
+
+_TASK_STOPWORDS = {
+    "the", "a", "an", "and", "or", "to", "in", "on", "for", "of", "with",
+    "is", "are", "be", "do", "doing", "i", "we", "you", "my", "our",
+}
+
+
+def _task_overlap_ratio(text: str, task: str) -> float:
+    """How much of `text` is just the shared TASK restated. Used to catch needs like
+    'clear space in the living room' when the task itself says 'clear the space' - that is
+    not a specific need, it is the task, and every robot echoing it produces near-duplicate
+    needs that the 1:1 Auction cannot merge (see the redundant-furniture-request bug)."""
+    a, b = _keywords(text) - _TASK_STOPWORDS, _keywords(task) - _TASK_STOPWORDS
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a)
 
 
 _OFFER_EXAMPLE = """EXAMPLE - kitchen robot, task "prepare a picnic basket":
@@ -77,6 +97,7 @@ Rules (each checked against your CAPABILITY and obs_scope, not the task in the a
 - can_do: every entry must use an object from obs_scope AND be something your CAPABILITY allows. If your capability says you cannot lift heavy things, no can_do entry may involve heavy objects.
 - can_provide: only tangible objects small/light enough to hand over (a cup, a tool, food, a document). NEVER things like "clean surface", "cleared space", "confirmation", "the room being set up" - those are states, not objects, and cannot be carried. When in doubt, ask: "could I physically place this in someone's hands?" If no, leave it out.
 - needs: name the specific item or specific task, not the task restated wholesale. "yoga mat" is a need; "set up living room" is not a need, it is the task itself and belongs in your own can_do/plan instead.
+- A need must be something YOUR OWN steps actually depend on. Ask yourself: "does what I am about to do get blocked without this?" If your own plan does not use or depend on it, it is not your need - do not list it just because the shared TASK mentions it or another room is involved. A robot whose own actions are unaffected by another room being cleared or set up should have no need about that room at all.
 - Do not list a need for something you can do or provide yourself.
 - Do not assign work to other robots. A need is a request; others may or may not volunteer.
 - Keep every entry short and concrete (a few words). Return JSON only."""
@@ -102,7 +123,15 @@ async def make_offer(agent: Agent) -> Offer:
         agent.log.log("offer", agent.id, "can_provide_filtered", dropped=dropped)
         if agent.verbose:
             print(f"  [OFFER FILTER] {agent.id}: non-passable can_provide dropped: {dropped}")
-    raw = raw.model_copy(update={"can_provide": kept})
+
+    kept_needs = [n for n in raw.needs if _task_overlap_ratio(n.text, agent.inp.task) < 0.6]
+    dropped_needs = [n for n in raw.needs if _task_overlap_ratio(n.text, agent.inp.task) >= 0.6]
+    if dropped_needs:
+        agent.log.log("offer", agent.id, "needs_filtered", dropped=[n.text for n in dropped_needs])
+        if agent.verbose:
+            print(f"  [OFFER FILTER] {agent.id}: task-restating needs dropped: {[n.text for n in dropped_needs]}")
+
+    raw = raw.model_copy(update={"can_provide": kept, "needs": kept_needs})
 
     agent.offer = Offer(agent=agent.id, **raw.model_dump())
     if agent.verbose:
