@@ -25,6 +25,7 @@ Prompt design notes (informed by the KCC 2-agent pilot, p2p_phase.py phase2_loca
   ignores capability limits produces steps the Graph's rule checks (or physical execution)
   would reject anyway.
 """
+
 from __future__ import annotations
 
 import json
@@ -32,6 +33,7 @@ import re
 
 from runtime import Agent
 from schemas import AgentInput, LocalPlan, Offer, RawLocalPlan
+
 
 _LOCAL_PLAN_EXAMPLE = """EXAMPLE - bedroom robot. Other robots broadcast these needs:
 - agent_1 needs (task): clear space in the living room
@@ -47,6 +49,7 @@ Your capability allows moving furniture. A good local plan may be:
 
 Here, target is a PREFERRED TARGET inferred from the broadcast offers. It is not a final assignment.
 Auction may confirm this match, change it, or leave it unresolved."""
+
 
 LOCAL_PLAN_SYSTEM = f"""You are one robot in a team of heterogeneous robots. Each robot plans for itself.
 
@@ -93,22 +96,51 @@ COLLABORATION RULES
 11. Keep the plan concise and ordered by execution. Respect any time limit in the TASK.
 12. Return JSON only."""
 
-def build_local_plan_user(inp: AgentInput, own_offer: Offer, others: dict[str, Offer]) -> str:
+
+def build_local_plan_user(
+    inp: AgentInput,
+    own_offer: Offer,
+    others: dict[str, Offer],
+) -> str:
     hidden = "\n".join(f"- {h}" for h in inp.hidden_info) or "- (none)"
-    others_txt = json.dumps({a: o.model_dump() for a, o in sorted(others.items())}, ensure_ascii=False, indent=2)
-    other_needs = [(a, n.kind, n.text) for a, o in sorted(others.items()) for n in o.needs]
-    needs_reminder = (
-        "\n".join(f"- {a} needs ({kind}): {text}" for a, kind, text in other_needs)
-        if other_needs else "- (nobody has an outstanding need)"
-    )
-    return (
-        f"TASK: {inp.task}\n\nYOU ARE: {own_offer.agent}\nCAPABILITY: {inp.capability}\n\n"
-        f"HIDDEN INFO:\n{hidden}\n\nYOUR OFFER:\n{json.dumps(own_offer.model_dump(), ensure_ascii=False, indent=2)}\n\n"
-        f"OTHER ROBOTS' OFFERS:\n{others_txt}\n\n"
-        f"OTHER ROBOTS' OUTSTANDING NEEDS (check before writing any LOCAL step):\n{needs_reminder}\n\n"
-        "The attached images show your own room."
+
+    others_txt = json.dumps(
+        {
+            a: o.model_dump()
+            for a, o in sorted(others.items())
+        },
+        ensure_ascii=False,
+        indent=2,
     )
 
+    other_needs = [
+        (a, n.kind, n.text)
+        for a, o in sorted(others.items())
+        for n in o.needs
+    ]
+
+    needs_reminder = (
+        "\n".join(
+            f"- {a} needs ({kind}): {text}"
+            for a, kind, text in other_needs
+        )
+        if other_needs
+        else "- (nobody has an outstanding need)"
+    )
+
+    return (
+        f"TASK: {inp.task}\n\n"
+        f"YOU ARE: {own_offer.agent}\n"
+        f"CAPABILITY: {inp.capability}\n\n"
+        f"HIDDEN INFO:\n{hidden}\n\n"
+        f"YOUR OFFER:\n"
+        f"{json.dumps(own_offer.model_dump(), ensure_ascii=False, indent=2)}\n\n"
+        f"OTHER ROBOTS' OFFERS:\n{others_txt}\n\n"
+        f"OTHER ROBOTS' OUTSTANDING NEEDS "
+        f"(check before writing any LOCAL step):\n"
+        f"{needs_reminder}\n\n"
+        "The attached images show your own room."
+    )
 
 
 def _token_set(text: str) -> set[str]:
@@ -117,12 +149,17 @@ def _token_set(text: str) -> set[str]:
 
 def _overlap(a: str, b: str) -> float:
     aa, bb = _token_set(a), _token_set(b)
+
     if not aa or not bb:
         return 0.0
+
     return len(aa & bb) / max(1, min(len(aa), len(bb)))
 
 
-def _plan_consistency_checks(agent: Agent, plan: LocalPlan) -> list[dict]:
+def _plan_consistency_checks(
+    agent: Agent,
+    plan: LocalPlan,
+) -> list[dict]:
     """Non-destructive checks between the broadcast Offer and Local Plan.
 
     These are warnings rather than hard filters: natural-language capability descriptions
@@ -130,96 +167,319 @@ def _plan_consistency_checks(agent: Agent, plan: LocalPlan) -> list[dict]:
     expose LLM drift in experiments instead of silently changing the plan.
     """
     warnings: list[dict] = []
+
     own = agent.offer
+
     if own is None:
         return warnings
 
-    other_needs = [(aid, n) for aid, o in agent.others_offers.items() for n in o.needs]
+    other_needs = [
+        (aid, n)
+        for aid, o in agent.others_offers.items()
+        for n in o.needs
+    ]
+
     for step in plan.steps:
         if step.type != "PASS" or step.kind != "task":
             continue
 
         matched_need = None
+
         for aid, need in other_needs:
-            if step.target == aid and _overlap(step.action, need.text) >= 0.20:
+            if (
+                step.target == aid
+                and _overlap(step.action, need.text) >= 0.20
+            ):
                 matched_need = (aid, need)
                 break
+
         if matched_need is None:
-            candidates = [(aid, n, _overlap(step.action, n.text)) for aid, n in other_needs]
+            candidates = [
+                (aid, n, _overlap(step.action, n.text))
+                for aid, n in other_needs
+            ]
+
             if candidates:
-                aid, need, score = max(candidates, key=lambda x: x[2])
+                aid, need, score = max(
+                    candidates,
+                    key=lambda x: x[2],
+                )
+
                 if score >= 0.35:
                     matched_need = (aid, need)
+
         if matched_need is None and other_needs:
-            warnings.append({"step": step.id, "issue": "pass_without_matching_other_need", "action": step.action})
+            warnings.append(
+                {
+                    "step": step.id,
+                    "issue": "pass_without_matching_other_need",
+                    "action": step.action,
+                }
+            )
 
         evidence = list(own.can_do) + [own.capability]
-        best = max((_overlap(step.action, x) for x in evidence), default=0.0)
+
+        best = max(
+            (_overlap(step.action, x) for x in evidence),
+            default=0.0,
+        )
+
         if best < 0.15:
-            warnings.append({"step": step.id, "issue": "pass_not_supported_by_declared_capability", "action": step.action})
+            warnings.append(
+                {
+                    "step": step.id,
+                    "issue": "pass_not_supported_by_declared_capability",
+                    "action": step.action,
+                }
+            )
+
     return warnings
 
-_REQUEST_VERBS = re.compile(r"^(request|ask)\b", re.IGNORECASE)
+
+_REQUEST_VERBS = re.compile(
+    r"^(request|ask)\b",
+    re.IGNORECASE,
+)
 
 
 def _fix_reversed_handoffs(plan: LocalPlan) -> list[str]:
-    """A PASS step means 'I will do this for you'. If its action instead reads as a request
-    ('Request agent_2 to move the...', 'Ask agent_3 to...'), the model has the direction
-    backwards - it is actually a NEED, and left as PASS it can never validly match anything
-    (nobody asked the sender to do it), so the real request silently disappears from the plan.
-    Flip it in place; `kind`/`item` stay valid since a task-need needs exactly the same fields."""
+    """A PASS step means 'I will do this for you'.
+
+    If its action instead reads as a request
+    ('Request agent_2 to move the...', 'Ask agent_3 to...'),
+    the model has the direction backwards - it is actually a NEED.
+
+    Flip it in place; `kind`/`item` stay valid since a task-need
+    needs exactly the same fields.
+    """
     fixed = []
+
     for s in plan.steps:
-        if s.type == "PASS" and _REQUEST_VERBS.match(s.action.strip()):
+        if (
+            s.type == "PASS"
+            and _REQUEST_VERBS.match(s.action.strip())
+        ):
             s.type = "NEED"
+
             if not s.action.lstrip().upper().startswith("[HELP]"):
                 s.action = "[HELP] " + s.action.strip()
-            s.target = None
+
+            # Keep the preferred target instead of deleting it.
+            # Auction treats target only as a weak hint.
             fixed.append(s.id)
+
     return fixed
 
 
-async def make_local_plan(agent: Agent, known_agents: set[str]) -> LocalPlan:
+def _fix_passes_that_are_own_needs(
+    agent: Agent,
+    plan: LocalPlan,
+) -> list[str]:
+    """Convert a PASS into NEED when it matches the robot's own OFFER need.
+
+    Example:
+      own Offer:
+        needs = "move heavy furniture"
+
+      model output:
+        PASS "move heavy furniture" -> agent_2
+
+    This is semantically reversed. The robot needs another robot to
+    perform the task, so the step must be represented as NEED.
+    """
+    fixed = []
+
+    if agent.offer is None or not agent.offer.needs:
+        return fixed
+
+    own_needs = [
+        need
+        for need in agent.offer.needs
+        if need.kind == "task"
+    ]
+
+    for step in plan.steps:
+        if step.type != "PASS" or step.kind != "task":
+            continue
+
+        best_overlap = max(
+            (
+                _overlap(step.action, need.text)
+                for need in own_needs
+            ),
+            default=0.0,
+        )
+
+        if best_overlap >= 0.35:
+            step.type = "NEED"
+
+            if not step.action.lstrip().upper().startswith("[HELP]"):
+                step.action = "[HELP] " + step.action.strip()
+
+            # Keep target as a preferred helper hint.
+            fixed.append(step.id)
+
+    return fixed
+
+
+async def make_local_plan(
+    agent: Agent,
+    known_agents: set[str],
+) -> LocalPlan:
     assert agent.offer is not None, "make_offer() must run first"
+
     agent.receive()
-    user = build_local_plan_user(agent.inp, agent.offer, agent.others_offers)
+
+    user = build_local_plan_user(
+        agent.inp,
+        agent.offer,
+        agent.others_offers,
+    )
 
     def parse(raw: dict) -> LocalPlan:
-        # HELP is a semantic tag over the existing NEED/task schema so this file remains
-        # compatible with the current schemas.py. The downstream Auction therefore still
-        # sees a normal task-NEED, while the plan text preserves the explicit [HELP] signal.
+        # HELP is a semantic tag over the existing NEED/task schema so this
+        # file remains compatible with the current schemas.py.
+        # The downstream Auction therefore still sees a normal task-NEED,
+        # while the plan text preserves the explicit [HELP] signal.
         for step in raw.get("steps", []):
             if str(step.get("type", "")).upper() == "HELP":
                 step["type"] = "NEED"
                 step["kind"] = "task"
-                action = str(step.get("action", "")).strip()
-                step["action"] = action if action.upper().startswith("[HELP]") else "[HELP] " + action
-                step["target"] = None
-        plan = LocalPlan.from_raw(agent.id, RawLocalPlan.model_validate(raw), known_agents)
+
+                action = str(
+                    step.get("action", "")
+                ).strip()
+
+                step["action"] = (
+                    action
+                    if action.upper().startswith("[HELP]")
+                    else "[HELP] " + action
+                )
+
+                # Do not erase a valid preferred helper target.
+                # Auction treats target as a weak hint.
+                step["target"] = step.get("target")
+
+        plan = LocalPlan.from_raw(
+            agent.id,
+            RawLocalPlan.model_validate(raw),
+            known_agents,
+        )
+
         return plan
 
-    agent.plan = await agent.ask("plan", LOCAL_PLAN_SYSTEM, user, parse, banner_label="LOCAL PLAN RAW")
+    agent.plan = await agent.ask(
+        "plan",
+        LOCAL_PLAN_SYSTEM,
+        user,
+        parse,
+        banner_label="LOCAL PLAN RAW",
+    )
 
+    # ------------------------------------------------------------
+    # Fix 1:
+    # PASS written as "Request ..." / "Ask ..."
+    # ------------------------------------------------------------
     reversed_ids = _fix_reversed_handoffs(agent.plan)
-    if reversed_ids:
-        agent.log.log("plan", agent.id, "reversed_pass_fixed", steps=reversed_ids)
-        if agent.verbose:
-            print(f"  [PLAN FIX] {agent.id}: PASS phrased as a request, changed to NEED: {reversed_ids}")
 
-    consistency = _plan_consistency_checks(agent, agent.plan)
+    # ------------------------------------------------------------
+    # Fix 2:
+    # PASS actually corresponds to THIS robot's own unmet need
+    # ------------------------------------------------------------
+    own_need_ids = _fix_passes_that_are_own_needs(
+        agent,
+        agent.plan,
+    )
+
+    if reversed_ids:
+        agent.log.log(
+            "plan",
+            agent.id,
+            "reversed_pass_fixed",
+            steps=reversed_ids,
+        )
+
+        if agent.verbose:
+            print(
+                f"  [PLAN FIX] {agent.id}: "
+                f"PASS phrased as a request, "
+                f"changed to NEED: {reversed_ids}"
+            )
+
+    if own_need_ids:
+        agent.log.log(
+            "plan",
+            agent.id,
+            "own_need_pass_fixed",
+            steps=own_need_ids,
+        )
+
+        if agent.verbose:
+            print(
+                f"  [PLAN FIX] {agent.id}: "
+                f"PASS matched own OFFER need, "
+                f"changed to NEED: {own_need_ids}"
+            )
+
+    # ------------------------------------------------------------
+    # Consistency checks
+    # ------------------------------------------------------------
+    consistency = _plan_consistency_checks(
+        agent,
+        agent.plan,
+    )
+
     if consistency:
-        agent.log.log("plan", agent.id, "plan_consistency_warning", warnings=consistency)
+        agent.log.log(
+            "plan",
+            agent.id,
+            "plan_consistency_warning",
+            warnings=consistency,
+        )
+
         if agent.verbose:
             for w in consistency:
-                print(f"  [PLAN CHECK] {agent.id} {w['issue']}: {w['step']} — {w['action']}")
+                print(
+                    f"  [PLAN CHECK] {agent.id} "
+                    f"{w['issue']}: "
+                    f"{w['step']} — "
+                    f"{w['action']}"
+                )
 
-    n_pass = sum(1 for s in agent.plan.steps if s.type == "PASS")
-    n_need = sum(1 for s in agent.plan.steps if s.type == "NEED")
+    # ------------------------------------------------------------
+    # Plan summary + detailed DEBUG
+    # ------------------------------------------------------------
+    n_pass = sum(
+        1
+        for s in agent.plan.steps
+        if s.type == "PASS"
+    )
+
+    n_need = sum(
+        1
+        for s in agent.plan.steps
+        if s.type == "NEED"
+    )
+
+    n_local = (
+        len(agent.plan.steps)
+        - n_pass
+        - n_need
+    )
+
     if agent.verbose:
-        print(f"  [PLAN] {agent.id}: steps={len(agent.plan.steps)} LOCAL={len(agent.plan.steps) - n_pass - n_need} NEED={n_need} PASS={n_pass}")
-      if agent.verbose:
-        print(f"  [PLAN DETAILS] {agent.id}")
-    
+        print(
+            f"  [PLAN] {agent.id}: "
+            f"steps={len(agent.plan.steps)} "
+            f"LOCAL={n_local} "
+            f"NEED={n_need} "
+            f"PASS={n_pass}"
+        )
+
+        print(
+            f"  [PLAN DETAILS] {agent.id}"
+        )
+
         for s in agent.plan.steps:
             print(
                 f"    [{s.type}] "
@@ -228,6 +488,22 @@ async def make_local_plan(agent: Agent, known_agents: set[str]) -> LocalPlan:
                 f"target={s.target} "
                 f"| {s.action}"
             )
-    agent.log.log("plan", agent.id, "plan_made", n_steps=len(agent.plan.steps), n_collab=len(agent.plan.collaboration_steps()))
-    agent.bus.broadcast(agent.id, "plan", agent.plan.model_dump(), phase="plan")
+
+    agent.log.log(
+        "plan",
+        agent.id,
+        "plan_made",
+        n_steps=len(agent.plan.steps),
+        n_collab=len(
+            agent.plan.collaboration_steps()
+        ),
+    )
+
+    agent.bus.broadcast(
+        agent.id,
+        "plan",
+        agent.plan.model_dump(),
+        phase="plan",
+    )
+
     return agent.plan
