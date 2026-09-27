@@ -1,22 +1,13 @@
-"""Stage 3 - AUCTION (edge generation, no LLM).
+"""Stage 3 - AUCTION (one-shot edge generation, no LLM).
 
-The Auction does NOT allocate tasks. Every robot has already planned for itself; the Auction
-only decides which PASS step serves which NEED step (a "handoff" edge), 1:1.
+The Auction runs after all Local Plans have been broadcast.
 
-  requests   = NEED steps (item or task)
-  volunteers = PASS steps of other robots with the same `kind`
-  score      = cosine( embed(request), embed(offer) )            (+ hint_bonus if the PASS hint
-               already points at the requester)
+It performs pairwise coordination only:
+  NEED = request for another robot to perform a task
+  PASS = offer to perform another robot's requested task
 
-A candidate must reach `min_score` on similarity alone (the hint can never justify a wrong
-match) and must not look like something its owner declared in `cannot_do`.
-
-Methods (same interface, swap with `method=`):
-  "consensus": consensus-style rounds. Every free PASS step bids on the request it can win,
-               bids are merged (highest wins, ties -> lower step id), and an outbid PASS becomes
-               free for the next round. The reference runtime computes this state centrally for
-               reproducibility; it should not be described as a fully distributed CBAA protocol.
-  "greedy"   : highest score first with the 1:1 constraint (simple baseline / volunteer-style).
+The Auction forms high-confidence 1:1 coordination edges in one shot.
+Ambiguous/unselected candidate edges remain available to Global Graph Reasoning.
 """
 from __future__ import annotations
 
@@ -28,8 +19,9 @@ from schemas import LocalPlan, Offer, Step, agent_of
 
 @dataclass
 class Match:
-    need: str     # NEED step id (the receiver side)
-    passed: str   # PASS step id (the provider side)
+    """Confirmed coordination edge: PASS owner -> NEED owner."""
+    need: str
+    passed: str
     score: float
 
 
@@ -38,8 +30,8 @@ class AuctionResult:
     method: str
     matches: list[Match]
     unmatched_needs: list[str]
-    unmatched_passes: list[str]          # their owners withdraw these steps
-    candidates: dict[str, list[dict]]    # need id -> [{"pass": id, "score": x}] (self-nominated volunteers)
+    unmatched_passes: list[str]
+    candidates: dict[str, list[dict]]
     scores: list[dict]
     rounds: int
 
@@ -50,7 +42,7 @@ class AuctionResult:
 
 
 def step_text(step: Step) -> str:
-    """Text that gets embedded: the canonical item name for items, the sentence for tasks."""
+    """Canonical text used for semantic matching."""
     return step.item if (step.kind == "item" and step.item) else step.action
 
 
@@ -63,40 +55,39 @@ def compute_scores(
     min_score: float = 0.40,
     cannot_do_threshold: float = 0.75,
 ):
-    """Build feasible NEED-PASS candidates.
-
-    The target hint is deliberately a *small tie-break bonus*.  A robot's hint says
-    who it expects to help, but it must not override semantic compatibility.
-    """
+    """Generate feasible NEED-PASS candidate edges."""
     needs = [s for p in plans.values() for s in p.steps if s.type == "NEED"]
     passes = [s for p in plans.values() for s in p.steps if s.type == "PASS"]
+
     if not needs or not passes:
         return {}, needs, passes
 
-    cannot = [(aid, t) for aid, o in offers.items() for t in o.cannot_do]
-    texts = [step_text(s) for s in needs + passes] + [t for _, t in cannot]
+    cannot = [(aid, text) for aid, offer in offers.items() for text in offer.cannot_do]
+    texts = [step_text(s) for s in needs + passes] + [text for _, text in cannot]
     emb = embedder.embed(texts)
-    e_need = emb[:len(needs)]
-    e_pass = emb[len(needs):len(needs) + len(passes)]
-    e_cannot = emb[len(needs) + len(passes):]
+
+    e_need = emb[: len(needs)]
+    e_pass = emb[len(needs) : len(needs) + len(passes)]
+    e_cannot = emb[len(needs) + len(passes) :]
     sim = e_pass @ e_need.T
 
     scores: dict[tuple[str, str], float] = {}
-    for i, p in enumerate(passes):
-        owner = agent_of(p.id)
-        # A provider cannot satisfy its own request.
-        for j, n in enumerate(needs):
-            if agent_of(n.id) == owner or n.kind != p.kind:
+
+    for i, passed in enumerate(passes):
+        owner = agent_of(passed.id)
+
+        for j, need in enumerate(needs):
+            if agent_of(need.id) == owner:
+                continue
+            if need.kind != passed.kind:
                 continue
 
             base = float(sim[i, j])
-            # Similarity is the actual feasibility signal; hint is only a small preference.
             if base < min_score:
                 continue
 
-            # Do not let a PASS survive when its owner explicitly says it cannot do the
-            # corresponding task.  This is a soft semantic capability guard, not a proof
-            # of physical feasibility.
+            # Capability safety guard: do not accept a PASS that semantically
+            # contradicts the owner's explicit cannot_do declaration.
             blocked = False
             for k, (aid, _) in enumerate(cannot):
                 if aid == owner and e_pass[i] @ e_cannot[k] >= cannot_do_threshold:
@@ -105,113 +96,98 @@ def compute_scores(
             if blocked:
                 continue
 
-            hint = 1.0 if p.target == agent_of(n.id) else 0.0
-            scores[(p.id, n.id)] = base + hint_bonus * hint
+            # target is only a weak hint; it cannot create a candidate below min_score.
+            hint = 1.0 if passed.target == agent_of(need.id) else 0.0
+            scores[(passed.id, need.id)] = base + hint_bonus * hint
+
     return scores, needs, passes
 
 
-# --------------------------------------------------------------------------- methods
-def _consensus(scores, need_ids, pass_ids, max_rounds, log):
-    rank = {p: i for i, p in enumerate(sorted(pass_ids))}
+def _select_edges(scores: dict[tuple[str, str], float]) -> list[Match]:
+    """Select a mutually consistent set of high-confidence 1:1 edges in one shot."""
+    used_pass: set[str] = set()
+    used_need: set[str] = set()
+    matches: list[Match] = []
 
-    def key(p, s):  # higher is better; ties go to the lower step id
-        return (round(s, 9), -rank[p])
+    ordered = sorted(scores.items(), key=lambda kv: (-kv[1], kv[0][1], kv[0][0]))
 
-    y: dict[str, tuple] = {}              # need -> (bid key, holder pass)  (the shared bid table)
-    holds: dict[str, str | None] = {p: None for p in pass_ids}
-    rounds = 0
-    for _ in range(max_rounds):
-        # local step: every free PASS step bids on its best request that it can still win
-        proposals: dict[str, tuple[str, tuple]] = {}
-        for p in sorted(pass_ids):
-            if holds[p] is not None:
-                continue
-            best = None
-            for n in sorted(need_ids):
-                s = scores.get((p, n))
-                if s is None:
-                    continue
-                k = key(p, s)
-                if n in y and k <= y[n][0]:
-                    continue  # cannot outbid the current holder
-                if best is None or k > best[1]:
-                    best = (n, k)
-            if best:
-                proposals[p] = best
-        if not proposals:
-            break
-        rounds += 1
-        # consensus step: per request, the highest proposal wins; the old holder is released
-        changed = 0
-        for n in sorted({n for n, _ in proposals.values()}):
-            p_best, (_, k_best) = max(((p, v) for p, v in proposals.items() if v[0] == n), key=lambda t: t[1][1])
-            if n in y and k_best <= y[n][0]:
-                continue
-            if n in y:
-                holds[y[n][1]] = None
-            y[n] = (k_best, p_best)
-            holds[p_best] = n
-            changed += 1
-        if log:
-            log.log("auction", "-", "round", round=rounds, proposals=len(proposals), changes=changed)
-    matches = [Match(need=n, passed=p, score=scores[(p, n)]) for n, (_, p) in sorted(y.items())]
-    return matches, rounds
-
-
-def _greedy(scores):
-    used_p, used_n, matches = set(), set(), []
-    for (p, n), s in sorted(scores.items(), key=lambda kv: (-kv[1], kv[0][1], kv[0][0])):
-        if p in used_p or n in used_n:
+    for (passed, need), score in ordered:
+        if passed in used_pass or need in used_need:
             continue
-        used_p.add(p)
-        used_n.add(n)
-        matches.append(Match(need=n, passed=p, score=s))
-    return sorted(matches, key=lambda m: m.need), 1
+        used_pass.add(passed)
+        used_need.add(need)
+        matches.append(Match(need=need, passed=passed, score=float(score)))
+
+    return sorted(matches, key=lambda m: m.need)
 
 
-# --------------------------------------------------------------------------- entry point
+def _build_candidates(scores, need_ids):
+    """Keep all candidate edges so Graph Reasoning can inspect unresolved alternatives."""
+    candidates = {need_id: [] for need_id in need_ids}
+    for (passed, need), score in scores.items():
+        candidates[need].append({"pass": passed, "score": round(float(score), 4)})
+    for need_id in candidates:
+        candidates[need_id].sort(key=lambda c: (-c["score"], c["pass"]))
+    return candidates
+
+
 def run_auction(
     plans: dict[str, LocalPlan],
     offers: dict[str, Offer],
     embedder,
     *,
-    method: str = "consensus",
-    hint_bonus: float = 0.5,
-    min_score: float = 0.4,
+    method: str = "one_shot",
+    hint_bonus: float = 0.05,
+    min_score: float = 0.40,
     cannot_do_threshold: float = 0.75,
-    max_rounds: int = 50,
+    max_rounds: int = 1,
     log: EventLog | None = None,
 ) -> AuctionResult:
-    scores, needs, passes = compute_scores(
-        plans, offers, embedder, hint_bonus=hint_bonus, min_score=min_score, cannot_do_threshold=cannot_do_threshold
-    )
-    need_ids = [n.id for n in needs]
-    pass_ids = [p.id for p in passes]
-    if method == "consensus":
-        matches, rounds = _consensus(scores, need_ids, pass_ids, max_rounds, log)
-    elif method == "greedy":
-        matches, rounds = _greedy(scores)
-    else:
+    """Run one-shot pairwise coordination after Local Plan broadcast.
+
+    method/max_rounds are retained for call-site compatibility; no consensus or
+    re-bidding loop is performed.
+    """
+    if method not in {"one_shot", "greedy", "consensus"}:
         raise ValueError(f"unknown auction method {method!r}")
 
-    cands: dict[str, list[dict]] = {n: [] for n in need_ids}
-    for (p, n), s in scores.items():
-        cands[n].append({"pass": p, "score": round(s, 4)})
-    for n in cands:
-        cands[n].sort(key=lambda c: (-c["score"], c["pass"]))
-
-    matched_n = {m.need for m in matches}
-    matched_p = {m.passed for m in matches}
-    result = AuctionResult(
-        method=method,
-        matches=matches,
-        unmatched_needs=[n for n in need_ids if n not in matched_n],
-        unmatched_passes=[p for p in pass_ids if p not in matched_p],
-        candidates=cands,
-        scores=[{"pass": p, "need": n, "score": round(s, 4)} for (p, n), s in sorted(scores.items())],
-        rounds=rounds,
+    scores, needs, passes = compute_scores(
+        plans,
+        offers,
+        embedder,
+        hint_bonus=hint_bonus,
+        min_score=min_score,
+        cannot_do_threshold=cannot_do_threshold,
     )
+
+    need_ids = [need.id for need in needs]
+    pass_ids = [passed.id for passed in passes]
+    matches = _select_edges(scores)
+    candidates = _build_candidates(scores, need_ids)
+
+    matched_needs = {m.need for m in matches}
+    matched_passes = {m.passed for m in matches}
+
+    result = AuctionResult(
+        method="one_shot",
+        matches=matches,
+        unmatched_needs=[n for n in need_ids if n not in matched_needs],
+        unmatched_passes=[p for p in pass_ids if p not in matched_passes],
+        candidates=candidates,
+        scores=[
+            {"pass": p, "need": n, "score": round(float(s), 4)}
+            for (p, n), s in sorted(scores.items(), key=lambda kv: (-kv[1], kv[0][1], kv[0][0]))
+        ],
+        rounds=1,
+    )
+
     if log:
-        log.log("auction", "-", "done", method=method, matched=len(matches), unmatched_needs=len(result.unmatched_needs),
-                withdrawn_passes=len(result.unmatched_passes), rounds=rounds)
+        log.log(
+            "auction", "-", "done",
+            method="one_shot",
+            matched=len(result.matches),
+            unmatched_needs=len(result.unmatched_needs),
+            rounds=1,
+        )
+
     return result
