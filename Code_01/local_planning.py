@@ -217,6 +217,17 @@ async def make_local_plan(agent: Agent, known_agents: set[str]) -> LocalPlan:
     n_need = sum(1 for s in agent.plan.steps if s.type == "NEED")
     if agent.verbose:
         print(f"  [PLAN] {agent.id}: steps={len(agent.plan.steps)} LOCAL={len(agent.plan.steps) - n_pass - n_need} NEED={n_need} PASS={n_pass}")
+      if agent.verbose:
+        print(f"  [PLAN DETAILS] {agent.id}")
+    
+        for s in agent.plan.steps:
+            print(
+                f"    [{s.type}] "
+                f"id={s.id} "
+                f"kind={s.kind} "
+                f"target={s.target} "
+                f"| {s.action}"
+            )
     agent.log.log("plan", agent.id, "plan_made", n_steps=len(agent.plan.steps), n_collab=len(agent.plan.collaboration_steps()))
     agent.bus.broadcast(agent.id, "plan", agent.plan.model_dump(), phase="plan")
     return agent.plan
