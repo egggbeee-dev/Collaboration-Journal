@@ -2,9 +2,8 @@
 
 Graph
   node = one step of one robot        (id, agent, order, type, kind, action, item, active)
-  edge = "sequence" (consecutive active steps of ONE robot, owned by that robot)
-         "handoff"  (PASS -> NEED, made by the Auction)
-         "order"    (extra cross-robot ordering added by the LLM reasoner)
+  edge = "sequence" (intra-agent execution dependency)
+         "collaboration" (inter-agent dependency; confirmed or candidate)
   A PASS step that lost the Auction is inactive (its owner withdrew it) but is remembered
   as a self-nominated candidate, so it can be re-instated by a `reassign`.
 
@@ -14,7 +13,7 @@ Layer 1 - RuleVerifier (deterministic, no LLM)
 Layer 2 - LLMReasoner (one central LLM call, text only, never sees images / hidden info)
   Looks for semantic errors and repairs them DIRECTLY, but only through 3 guarded operations:
     reassign : move a NEED to another *self-nominated* candidate (no new collaboration)
-    unmatch  : cut a wrong handoff
+    unmatch  : cut a wrong collaboration dependency
     add_order: add a cross-robot ordering constraint between two existing steps
   It cannot create, delete or rewrite steps. Every operation is validated and reverted if it
   would create a cycle.
@@ -53,7 +52,8 @@ class Node:
 class Edge:
     src: str
     dst: str
-    kind: str  # sequence | handoff | order
+    kind: str  # sequence | collaboration
+    status: str = "confirmed"  # confirmed | candidate
 
 
 class PlanGraph:
@@ -65,7 +65,7 @@ class PlanGraph:
                 self.nodes[s.id] = Node(s.id, aid, s.order, s.type, s.kind, s.action, s.item)
         self.handoff: dict[str, str] = {m.need: m.passed for m in auction.matches}          # need -> pass
         self.handoff_score: dict[str, float] = {m.need: m.score for m in auction.matches}
-        self.extra_order: list[tuple[str, str]] = []
+        self.extra_collaboration: list[tuple[str, str]] = []
         self.candidates: dict[str, list[dict]] = auction.candidates
         matched = set(self.handoff.values())
         for n in self.nodes.values():
@@ -83,24 +83,37 @@ class PlanGraph:
     def agent_sequence(self, agent: str) -> list[Node]:
         return sorted((n for n in self.nodes.values() if n.agent == agent and n.active), key=lambda n: n.order)
 
-    def edges(self) -> list[Edge]:
+    def edges(self, include_candidates: bool = False) -> list[Edge]:
         out: list[Edge] = []
         for agent in sorted({n.agent for n in self.nodes.values()}):
             seq = self.agent_sequence(agent)
             out += [Edge(a.id, b.id, "sequence") for a, b in zip(seq, seq[1:])]
         for need, p in sorted(self.handoff.items()):
             if self.nodes[need].active and self.nodes[p].active:
-                out.append(Edge(p, need, "handoff"))
-        for a, b in self.extra_order:
+                out.append(Edge(p, need, "collaboration", "confirmed"))
+        for a, b in self.extra_collaboration:
             if self.nodes[a].active and self.nodes[b].active:
-                out.append(Edge(a, b, "order"))
+                out.append(Edge(a, b, "collaboration", "confirmed"))
+        # Unresolved Auction candidates remain in the graph as candidate collaboration edges.
+        # They are visible to the reasoner but do not constrain execution until confirmed.
+        confirmed_pairs = set((p, n) for n, p in self.handoff.items())
+        for need, lst in self.candidates.items():
+            if need not in self.nodes or not self.nodes[need].active:
+                continue
+            for c in lst:
+                p = c["pass"]
+                if (p, need) in confirmed_pairs or p not in self.nodes:
+                    continue
+                out.append(Edge(p, need, "collaboration", "candidate"))
+        if not include_candidates:
+            out = [e for e in out if e.status == "confirmed"]
         return out
 
     def snapshot(self):
-        return copy.deepcopy(({i: n.active for i, n in self.nodes.items()}, self.handoff, self.handoff_score, self.extra_order))
+        return copy.deepcopy(({i: n.active for i, n in self.nodes.items()}, self.handoff, self.handoff_score, self.extra_collaboration))
 
     def restore(self, snap) -> None:
-        active, self.handoff, self.handoff_score, self.extra_order = copy.deepcopy(snap)
+        active, self.handoff, self.handoff_score, self.extra_collaboration = copy.deepcopy(snap)
         for i, a in active.items():
             self.nodes[i].active = a
 
@@ -108,15 +121,15 @@ class PlanGraph:
         return {
             "nodes": [n.__dict__ for n in sorted(self.nodes.values(), key=lambda n: self.sort_key(n.id))],
             "handoffs": [{"need": n, "pass": p, "score": self.handoff_score.get(n)} for n, p in sorted(self.handoff.items())],
-            "extra_order": [list(t) for t in self.extra_order],
-            "edges": [e.__dict__ for e in self.edges()],
+            "extra_collaboration": [list(t) for t in self.extra_collaboration],
+            "edges": [e.__dict__ for e in self.edges(include_candidates=True)],
         }
 
 
 # =========================================================================== graph algorithms
 def find_cycle(graph: PlanGraph) -> list[Edge] | None:
     adj: dict[str, list[Edge]] = defaultdict(list)
-    for e in graph.edges():
+    for e in graph.edges(include_candidates=False):
         adj[e.src].append(e)
     color = {n: 0 for n in graph.active_ids()}
     parent: dict[str, Edge] = {}
@@ -153,7 +166,7 @@ def topological_levels(graph: PlanGraph):
     ids = graph.active_ids()
     indeg = {i: 0 for i in ids}
     succ: dict[str, list[str]] = defaultdict(list)
-    for e in graph.edges():
+    for e in graph.edges(include_candidates=False):
         succ[e.src].append(e.dst)
         indeg[e.dst] += 1
     level = {i: 0 for i in ids}
@@ -173,7 +186,7 @@ def topological_levels(graph: PlanGraph):
 
 def reachable(graph: PlanGraph, a: str, b: str) -> bool:
     adj: dict[str, list[str]] = defaultdict(list)
-    for e in graph.edges():
+    for e in graph.edges(include_candidates=False):
         adj[e.src].append(e.dst)
     seen, stack = {a}, [a]
     while stack:
@@ -211,23 +224,20 @@ def rule_verify(graph: PlanGraph) -> RuleReport:
             n.active = False
             rep.fixes.append({"rule": "orphan_pass_withdrawn", "step": n.id})
 
-    # 2. cycles -> remove the least-committed repair edge first.  We prefer an LLM-added
-    # order edge; if a handoff itself closes the cycle, remove the lowest-confidence handoff.
-    # The verifier never invents a new action/provider.
+    # 2. cycles -> cut the weakest handoff inside the cycle (never invent steps)
     while (cyc := find_cycle(graph)) is not None:
-        extra = [e for e in cyc if e.kind == "order"]
-        if extra:
-            e = extra[-1]
-            graph.extra_order.remove((e.src, e.dst))
-            rep.fixes.append({"rule": "cycle_broken", "removed_order": [e.src, e.dst]})
-            continue
-        hand = [e for e in cyc if e.kind == "handoff"]
+        hand = [e for e in cyc if e.kind == "collaboration" and e.status == "confirmed"]
         if hand:
             e = min(hand, key=lambda e: graph.handoff_score.get(e.dst, 0.0))
             del graph.handoff[e.dst]
             graph.handoff_score.pop(e.dst, None)
             graph.nodes[e.src].active = False
             rep.fixes.append({"rule": "cycle_broken", "removed_handoff": [e.src, e.dst]})
+            continue
+        extra = [e for e in cyc if e.kind == "collaboration" and e.status == "confirmed" and (e.src, e.dst) in graph.extra_collaboration]
+        if extra:
+            graph.extra_collaboration.remove((extra[-1].src, extra[-1].dst))
+            rep.fixes.append({"rule": "cycle_broken", "removed_order": [extra[-1].src, extra[-1].dst]})
             continue
         rep.ok = False
         rep.warnings.append("unbreakable cycle inside a single robot's own sequence")
@@ -280,10 +290,7 @@ Each robot wrote its own plan (a list of steps in order). A matching process the
 
 Your job is to check the plan thoroughly and repair problems directly, using ONLY these operations:
   {"op": "reassign", "need": <NEED step id>, "to_pass": <PASS step id>, "reason": string}
-      Give a NEED to a different volunteer. `to_pass` must be listed in that need's candidates.
-      If that PASS currently serves another NEED, the system will treat the reassign as a
-      swap when the two assignments exchange providers; do not avoid a necessary swap merely
-      because the PASS is currently occupied.
+      Give a NEED to a different volunteer. `to_pass` must be listed in that need's candidates and not already used by another need.
   {"op": "unmatch", "need": <NEED step id>, "reason": string}
       Cut a handoff that is wrong (the PASS step does not really provide what the NEED asks for).
   {"op": "add_order", "before": <step id>, "after": <step id>, "reason": string}
@@ -318,7 +325,7 @@ def serialize_for_llm(graph: PlanGraph, report: RuleReport, scope: str = "full")
         "task": graph.task,
         "robots": agents,
         "handoffs": [{"need": n, "pass": p, "score": graph.handoff_score.get(n)} for n, p in sorted(graph.handoff.items()) if graph.nodes[n].active and graph.nodes[p].active],
-        "extra_order": [{"before": a, "after": b} for a, b in graph.extra_order],
+        "collaboration_edges": [{"src": e.src, "dst": e.dst, "status": e.status, "score": graph.handoff_score.get(e.dst)} for e in graph.edges(include_candidates=True) if e.kind == "collaboration"],
         "candidates": cands,
         "unresolved_needs": report.unresolved_needs,
         "rule_warnings": report.warnings,
@@ -342,32 +349,14 @@ def apply_op(graph: PlanGraph, op: GraphOp) -> tuple[bool, str]:
             return False, "not a self-nominated candidate for this need (no new collaboration allowed)"
         if graph.handoff.get(need) == to_pass:
             return False, "already matched to that step"
+        if to_pass in graph.handoff.values():
+            return False, "that PASS step already serves another need"
         old = graph.handoff.get(need)
-        occupied_need = next((n for n, p in graph.handoff.items() if p == to_pass and n != need), None)
-
-        if occupied_need is not None:
-            # A common repair is a two-way exchange: A currently owns PASS-1 and B owns
-            # PASS-2, but the semantic evidence says A should receive PASS-2 and B PASS-1.
-            # Apply the swap atomically instead of rejecting the first reassign as a
-            # one-to-one conflict. This preserves the no-new-collaboration boundary.
-            if old is None or old not in {c["pass"] for c in graph.candidates.get(occupied_need, [])}:
-                return False, "PASS is occupied by another need and the requested exchange is not a valid swap"
-            other_candidates = {c["pass"]: c["score"] for c in graph.candidates.get(occupied_need, [])}
-            if old not in other_candidates:
-                return False, "PASS is occupied and the displaced need cannot use the old provider"
-
-            graph.handoff[need] = to_pass
-            graph.handoff_score[need] = cand[to_pass]
-            graph.handoff[occupied_need] = old
-            graph.handoff_score[occupied_need] = other_candidates[old]
-            nodes[to_pass].active = True
-            nodes[old].active = True
-        else:
-            if old:
-                nodes[old].active = False  # old provider withdraws (stays a candidate)
-            nodes[to_pass].active = True   # new provider re-instates its own volunteering step
-            graph.handoff[need] = to_pass
-            graph.handoff_score[need] = cand[to_pass]
+        if old:
+            nodes[old].active = False  # old provider withdraws (stays a candidate)
+        nodes[to_pass].active = True   # new provider re-instates its own volunteering step
+        graph.handoff[need] = to_pass
+        graph.handoff_score[need] = cand[to_pass]
 
     elif op.op == "unmatch":
         need = op.need
@@ -385,7 +374,7 @@ def apply_op(graph: PlanGraph, op: GraphOp) -> tuple[bool, str]:
             return False, "same robot: its own order is owned by that robot"
         if reachable(graph, a, b):
             return False, "already implied by existing edges"
-        graph.extra_order.append((a, b))
+        graph.extra_collaboration.append((a, b))
 
     if find_cycle(graph) is not None:
         graph.restore(snap)
