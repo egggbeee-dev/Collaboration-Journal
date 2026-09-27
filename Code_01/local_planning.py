@@ -1,7 +1,7 @@
 """Stage 2 - LOCAL PLANNING.
 
 Every robot plans for itself (no task allocation). It reads the other robots' broadcast
-Offers, marks the steps that need collaboration (NEED / PASS) and broadcasts its plan.
+Offers, marks the steps that need collaboration (NEED / HELP / PASS) and broadcasts its plan.
 A robot that can do something another robot asked for volunteers by writing a PASS/task
 step into its OWN plan.
 
@@ -67,14 +67,17 @@ Write YOUR OWN plan as an ordered list of steps, in the order you would execute 
 Step types:
 - LOCAL: something you do alone, for your own room, that nobody else asked for.
 - NEED + item: you must receive an item you do not have.
-- NEED + task: something you cannot do (see your CAPABILITY) and want another robot to do for you.
+- NEED + item: you must receive an item you do not have.
+- HELP + task (encoded as NEED/task with a [HELP] tag in the action): something you cannot do (see your CAPABILITY) and want another robot to do for you.
 - PASS + item: you hand an item you have to another robot who NEEDS it (see the other offers).
-- PASS + task: you volunteer to do a task that another robot's OFFER lists in its `needs` and that your CAPABILITY allows.
+- PASS + task: you volunteer to do a task that another robot's OFFER lists in its `needs` and that your CAPABILITY allows. PASS is the provider-side response to another robot's HELP/NEED.
 
 CRITICAL RULE - visibility of help you give:
   Before writing a LOCAL step, check every other robot's OFFER `needs` list. If what you are about
   to do matches one of THEIR needs (same item, or same task), you must write it as PASS instead of
-  LOCAL, with `target` set to that robot. A LOCAL step is only visible inside your own plan - if you
+  LOCAL, with `target` set to that robot. If YOU cannot perform a required task because of your
+  CAPABILITY, write it as NEED/task with action starting `[HELP]` and leave `target` null; the Auction
+  will determine who can help you. A LOCAL step is only visible inside your own plan - if you
   quietly do someone else's requested task as LOCAL, nobody else can see it happened, and their NEED
   is left looking unmatched even though the work was done. Doing the work is not enough; you must
   also announce it as PASS so it can be matched to their NEED.
@@ -92,10 +95,14 @@ CRITICAL RULE - one PASS per need, not one per object:
   never happened even though you planned to do it.
 
 Other rules:
-- Plan only what you can do with your own capability. If the task needs something you cannot do, add a NEED step instead of pretending.
+- Plan only what you can do with your own capability. If the task needs something you cannot do because of your CAPABILITY, add a NEED/task step whose
+action starts with `[HELP]`. Do not write `Request agent_X...` or `Ask agent_X...`, and do not choose
+the helper in Local Planning. The helper is selected later by Auction.
 - Use only objects visible in your images or stated in your HIDDEN INFO. Never invent objects.
 - A NEED must name a specific item or task, not the shared TASK restated wholesale ("yoga mat" is fine; "set up the living room" is not - that is the task itself, not a specific need).
-- `target` is only a hint about who you expect to match with; it is not binding. Use null if unsure.
+- For `[HELP]` steps, `target` MUST be null because Local Planning must not allocate the task.
+- For PASS steps, `target` may identify the robot whose need you are satisfying; this is a coordination hint,
+  not a new allocation mechanism.
 - Respect any time limit in the TASK: keep the plan short and put NEED steps late enough that the other robot can prepare, and PASS steps early enough.
 - Do not write steps for other robots. Return JSON only."""
 
@@ -179,6 +186,9 @@ def _fix_reversed_handoffs(plan: LocalPlan) -> list[str]:
     for s in plan.steps:
         if s.type == "PASS" and _REQUEST_VERBS.match(s.action.strip()):
             s.type = "NEED"
+            if not s.action.lstrip().upper().startswith("[HELP]"):
+                s.action = "[HELP] " + s.action.strip()
+            s.target = None
             fixed.append(s.id)
     return fixed
 
@@ -189,7 +199,21 @@ async def make_local_plan(agent: Agent, known_agents: set[str]) -> LocalPlan:
     user = build_local_plan_user(agent.inp, agent.offer, agent.others_offers)
 
     def parse(raw: dict) -> LocalPlan:
-        return LocalPlan.from_raw(agent.id, RawLocalPlan.model_validate(raw), known_agents)
+        # HELP is a semantic tag over the existing NEED/task schema so this file remains
+        # compatible with the current schemas.py. The downstream Auction therefore still
+        # sees a normal task-NEED, while the plan text preserves the explicit [HELP] signal.
+        for step in raw.get("steps", []):
+            if str(step.get("type", "")).upper() == "HELP":
+                step["type"] = "NEED"
+                step["kind"] = "task"
+                action = str(step.get("action", "")).strip()
+                step["action"] = action if action.upper().startswith("[HELP]") else "[HELP] " + action
+                step["target"] = None
+        plan = LocalPlan.from_raw(agent.id, RawLocalPlan.model_validate(raw), known_agents)
+        for step in plan.steps:
+            if step.type == "NEED" and step.kind == "task" and step.action.strip().upper().startswith("[HELP]"):
+                step.target = None
+        return plan
 
     agent.plan = await agent.ask("plan", LOCAL_PLAN_SYSTEM, user, parse, banner_label="LOCAL PLAN RAW")
 
