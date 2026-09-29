@@ -1,4 +1,27 @@
-# schemas.py
+"""JSON schemas for messages flowing through the multi-robot planning pipeline.
+
+Pipeline:
+    Offer
+      ↓
+    Local Plan
+      ↓
+    Auction
+      ↓
+    Graph Reasoning
+      ↓
+    Joint Plan
+
+Local-plan step types:
+    LOCAL     : perform an action locally
+    ASK_HELP  : ask another robot to perform a task
+    HELP      : perform a task requested by another robot
+    RECEIVE   : receive a physical item from another robot
+    PASS      : pass a physical item to another robot
+
+Pairing semantics:
+    ASK_HELP ↔ HELP
+    RECEIVE  ↔ PASS
+"""
 
 from __future__ import annotations
 
@@ -7,21 +30,27 @@ from typing import Literal, Optional
 from pydantic import BaseModel, Field, model_validator
 
 
-StepType = Literal["LOCAL", "NEED", "PASS"]
+# ---------------------------------------------------------------------------
+# basic types
+# ---------------------------------------------------------------------------
+
+StepType = Literal[
+    "LOCAL",
+    "ASK_HELP",
+    "HELP",
+    "RECEIVE",
+    "PASS",
+]
+
 Kind = Literal["item", "task"]
 
 
-# ===========================================================================
-# INPUT
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# input
+# ---------------------------------------------------------------------------
 
 class AgentInput(BaseModel):
-    """
-    Private input received by one robot.
-
-    Raw images and hidden information remain private.
-    Only Offer / Local Plan are broadcast.
-    """
+    """Private input available only to one robot."""
 
     task: str
     capability: str
@@ -30,7 +59,7 @@ class AgentInput(BaseModel):
 
 
 class TaskConfig(BaseModel):
-    """One scenario: shared task + one entry per robot."""
+    """Shared task + private information for each robot."""
 
     task: str
     agents: list[dict]
@@ -39,45 +68,18 @@ class TaskConfig(BaseModel):
         return {
             f"agent_{i}": AgentInput(
                 task=self.task,
-                **agent,
+                **a,
             )
-            for i, agent in enumerate(self.agents, start=1)
+            for i, a in enumerate(self.agents, start=1)
         }
 
 
-def describe_config(config: TaskConfig) -> str:
-    """Create a human-readable summary of the configuration."""
-
-    lines = [
-        f"TASK: {config.task}",
-        "",
-        f"NUMBER OF AGENTS: {len(config.agents)}",
-    ]
-
-    for i, agent in enumerate(config.agents, start=1):
-        lines.append("")
-        lines.append(f"AGENT {i}")
-        lines.append(
-            f"  CAPABILITY: {agent.get('capability', '')}"
-        )
-        lines.append(
-            f"  IMAGES: {len(agent.get('images', []))}"
-        )
-        lines.append(
-            f"  HIDDEN INFO: {len(agent.get('hidden_info', []))} items"
-        )
-
-    return "\n".join(lines)
-
-
-# ===========================================================================
-# OFFER
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# offer
+# ---------------------------------------------------------------------------
 
 class ObsItem(BaseModel):
-    """
-    Concrete object/fact within the robot's observation scope.
-    """
+    """Object or entity observed by the robot."""
 
     object: str
     location: Optional[str] = None
@@ -85,9 +87,7 @@ class ObsItem(BaseModel):
 
 
 class CanDoAction(BaseModel):
-    """
-    Concrete action the robot can perform itself.
-    """
+    """Concrete action the robot can physically perform."""
 
     action: str
     object: Optional[str] = None
@@ -96,9 +96,7 @@ class CanDoAction(BaseModel):
 
 
 class CannotDoAction(BaseModel):
-    """
-    Task-relevant action that the robot cannot perform.
-    """
+    """Task-relevant action the robot cannot perform."""
 
     action: str
     object: Optional[str] = None
@@ -107,25 +105,26 @@ class CannotDoAction(BaseModel):
 
 
 class CanProvide(BaseModel):
-    """
-    Concrete resource or contribution that the robot can provide.
-    """
+    """Physical resource or task capability that can be offered."""
 
     type: Kind
+
+    # Used mainly for item-level provision.
     object: Optional[str] = None
     location: Optional[str] = None
+
+    # Used mainly for task-level capability.
     action: Optional[str] = None
 
 
 class OfferNeed(BaseModel):
-    """
-    Concrete dependency required from another robot.
+    """A dependency required by the robot.
 
-    `kind == "item"`:
-        The robot needs a physical item.
+    kind="item":
+        The robot needs a physical item from another robot.
 
-    `kind == "task"`:
-        The robot needs another robot to perform an action/task.
+    kind="task":
+        The robot needs another robot to perform a task.
     """
 
     kind: Kind
@@ -135,11 +134,7 @@ class OfferNeed(BaseModel):
 
 
 class RawOffer(BaseModel):
-    """
-    Structured Offer generated by the LLM.
-
-    The LLM does not generate the robot ID.
-    """
+    """Offer generated by the LLM."""
 
     capability: str
 
@@ -165,68 +160,90 @@ class RawOffer(BaseModel):
 
 
 class Offer(RawOffer):
-    """
-    Broadcast Offer.
-
-    Agent ID is added by the runtime code.
-    """
+    """Broadcast Offer with the robot ID attached."""
 
     agent: str
 
 
-# ===========================================================================
-# LOCAL PLAN
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# local plan
+# ---------------------------------------------------------------------------
 
 class RawStep(BaseModel):
-    """
-    One local-plan step generated by the LLM.
-    """
+    """One local-plan step generated by the LLM."""
 
     type: StepType
 
-    action: str = Field(
-        min_length=1
-    )
+    # Natural-language description of the step.
+    action: str = Field(min_length=1)
 
+    # Optional semantic information.
+    # We keep this field because it is useful to distinguish
+    # task-level and item-level collaboration in Auction.
     kind: Optional[Kind] = None
+
+    # Physical object involved in RECEIVE / PASS.
     item: Optional[str] = None
+
+    # Non-binding hint about the expected collaborating robot.
     target: Optional[str] = None
 
     @model_validator(mode="after")
-    def _check_collab_fields(self):
-
-        # LOCAL does not need collaboration metadata.
+    def _check_step_fields(self):
+        # ---------------------------------------------------------------
+        # LOCAL
+        # ---------------------------------------------------------------
         if self.type == "LOCAL":
             self.kind = None
             self.item = None
             self.target = None
             return self
 
-        # NEED / PASS must specify whether the collaboration
-        # concerns an item or a task.
-        if self.kind is None:
-            raise ValueError(
-                f"{self.type} step needs 'kind' "
-                f"(item|task): {self.action!r}"
-            )
+        # ---------------------------------------------------------------
+        # ASK_HELP / HELP
+        # ---------------------------------------------------------------
+        if self.type in {"ASK_HELP", "HELP"}:
+            # These always represent task-level collaboration.
+            if self.kind is None:
+                self.kind = "task"
 
-        # Item collaboration must identify the item.
-        if self.kind == "item" and not self.item:
-            raise ValueError(
-                f"{self.type}/item step needs 'item': "
-                f"{self.action!r}"
-            )
+            if self.kind != "task":
+                raise ValueError(
+                    f"{self.type} must use kind='task': {self.action!r}"
+                )
+
+            # No physical item is needed for task-level help.
+            self.item = None
+
+            return self
+
+        # ---------------------------------------------------------------
+        # RECEIVE / PASS
+        # ---------------------------------------------------------------
+        if self.type in {"RECEIVE", "PASS"}:
+            # These always represent physical-item transfer.
+            if self.kind is None:
+                self.kind = "item"
+
+            if self.kind != "item":
+                raise ValueError(
+                    f"{self.type} must use kind='item': {self.action!r}"
+                )
+
+            if not self.item:
+                raise ValueError(
+                    f"{self.type} requires 'item': {self.action!r}"
+                )
+
+            return self
 
         return self
 
 
 class RawLocalPlan(BaseModel):
-    """
-    Raw local plan generated by the LLM.
+    """LLM-generated local plan.
 
-    Empty plans are allowed because a robot may have
-    no relevant contribution to the global task.
+    Empty plans are allowed when the robot has no relevant contribution.
     """
 
     steps: list[RawStep] = Field(
@@ -235,15 +252,15 @@ class RawLocalPlan(BaseModel):
 
 
 class Step(RawStep):
-    """
-    Validated local-plan step with deterministic ID/order.
-    """
+    """Validated local-plan step with code-assigned ID and order."""
 
     id: str
     order: int
 
 
 class LocalPlan(BaseModel):
+    """A robot's complete local plan."""
+
     agent: str
     steps: list[Step]
 
@@ -260,19 +277,16 @@ class LocalPlan(BaseModel):
         steps: list[Step] = []
 
         for i, s in enumerate(raw.steps, start=1):
-
             data = s.model_dump()
 
-            # target is only a preferred coordination hint.
-            # Invalid/self targets are removed.
-            if (
-                data["target"] is not None
-                and (
+            # target is only a hint.
+            # Remove invalid/self references.
+            if data["target"] is not None:
+                if (
                     data["target"] not in known_agents
                     or data["target"] == agent
-                )
-            ):
-                data["target"] = None
+                ):
+                    data["target"] = None
 
             steps.append(
                 Step(
@@ -288,16 +302,74 @@ class LocalPlan(BaseModel):
         )
 
     def collaboration_steps(self) -> list[Step]:
+        """Return all non-local collaboration steps."""
+
         return [
             s
             for s in self.steps
             if s.type != "LOCAL"
         ]
 
+    def ask_help_steps(self) -> list[Step]:
+        return [
+            s
+            for s in self.steps
+            if s.type == "ASK_HELP"
+        ]
+
+    def help_steps(self) -> list[Step]:
+        return [
+            s
+            for s in self.steps
+            if s.type == "HELP"
+        ]
+
+    def receive_steps(self) -> list[Step]:
+        return [
+            s
+            for s in self.steps
+            if s.type == "RECEIVE"
+        ]
+
+    def pass_steps(self) -> list[Step]:
+        return [
+            s
+            for s in self.steps
+            if s.type == "PASS"
+        ]
+
+
+# ---------------------------------------------------------------------------
+# utilities
+# ---------------------------------------------------------------------------
 
 def agent_of(step_id: str) -> str:
-    """
-    '3-2' -> 'agent_3'
-    """
-
+    """Convert '3-2' -> 'agent_3'."""
     return f"agent_{step_id.split('-')[0]}"
+
+
+def describe_config(config: TaskConfig) -> str:
+    """Human-readable description of the actual experiment configuration."""
+
+    lines = [
+        f"TASK: {config.task}",
+        "",
+    ]
+
+    for i, a in enumerate(config.agents, start=1):
+        lines.append(f"agent_{i}")
+        lines.append(
+            f"  capability : {a.get('capability', '')}"
+        )
+        lines.append(
+            f"  images     : {a.get('images', [])}"
+        )
+
+        hidden = a.get("hidden_info", [])
+
+        lines.append(
+            f"  hidden_info: "
+            f"{hidden if hidden else '(none)'}"
+        )
+
+    return "\n".join(lines)
