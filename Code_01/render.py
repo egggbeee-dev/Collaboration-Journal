@@ -1,18 +1,35 @@
-"""Rule-based conversion of the final graph into a human-readable Joint Plan.
-
-The dependency graph and slot information are still retained in the JSON output for
-analysis. The human-readable text is rendered robot-centrically: each robot gets its
-own ordered list of actions, while hand-off steps explicitly name the partner robot.
-
-No LLM is used here, so every compared method receives the same deterministic renderer.
 """
+Stage 5 - JOINT PLAN RENDERING
+
+Final Dependency Graph
+        ↓
+  Topological Levels
+        ↓
+    Joint Plan
+        ↓
+[Step 1]
+- [R1] [LOCAL] ...
+- [R2] [LOCAL] ...
+
+[Step 2]
+- [R2] [HELP] ...
+...
+
+No LLM is used in this stage.
+The final Joint Plan is deterministically rendered from the Dependency Graph.
+"""
+
 from __future__ import annotations
 
 from graph_reasoning import PlanGraph, RuleReport
 
 
+# ============================================================================
+# helpers
+# ============================================================================
+
 def _robot_label(agent: str) -> str:
-    """Convert internal ids such as ``agent_1`` to compact labels such as ``R1``."""
+    """Convert agent_1 -> R1."""
     if agent.startswith("agent_"):
         suffix = agent[len("agent_"):]
         if suffix.isdigit():
@@ -21,134 +38,360 @@ def _robot_label(agent: str) -> str:
 
 
 def _partner(graph: PlanGraph, nid: str) -> str | None:
-    n = graph.nodes[nid]
-    if n.type == "NEED":
-        provider = graph.handoff.get(nid)
-        return graph.nodes[provider].agent if provider else None
-    if n.type == "PASS":
-        need = next((need_id for need_id, pass_id in graph.handoff.items() if pass_id == nid), None)
-        return graph.nodes[need].agent if need else None
+    """
+    Return the partner robot for a collaboration step.
+
+    handoff:
+        request -> provider
+    """
+
+    node = graph.nodes[nid]
+
+    # ASK_HELP / RECEIVE
+    if node.type in {"ASK_HELP", "RECEIVE"}:
+        provider_id = graph.handoff.get(nid)
+
+        if provider_id and provider_id in graph.nodes:
+            return graph.nodes[provider_id].agent
+
+        return None
+
+    # HELP / PASS
+    if node.type in {"HELP", "PASS"}:
+        request_id = next(
+            (
+                request_id
+                for request_id, provider_id in graph.handoff.items()
+                if provider_id == nid
+            ),
+            None,
+        )
+
+        if request_id and request_id in graph.nodes:
+            return graph.nodes[request_id].agent
+
+        return None
+
     return None
 
 
+def _what(node) -> str:
+    """Return the main object/action description."""
+
+    if node.kind == "item" and node.item:
+        return node.item
+
+    return node.action
+
+
+# ============================================================================
+# natural-language rendering
+# ============================================================================
+
 def _line(graph: PlanGraph, nid: str) -> tuple[str, str | None]:
-    """Render one graph node without repeating the robot id in every line."""
-    n = graph.nodes[nid]
+    """
+    Render one graph node.
+
+    Output format:
+        [TYPE] natural-language action
+    """
+
+    node = graph.nodes[nid]
+
     partner = _partner(graph, nid)
     partner_label = _robot_label(partner) if partner else None
-    what = n.item if (n.kind == "item" and n.item) else n.action
 
-    if n.type == "LOCAL":
-        text = n.action
-    elif n.type == "PASS" and n.kind == "item":
-        text = f"Hand {what} to {partner_label}" if partner_label else f"Hand {what} over"
-    elif n.type == "PASS":  # task volunteer
-        text = f"{n.action} for {partner_label}" if partner_label else n.action
-    elif n.type == "NEED" and n.kind == "item":
-        text = f"Receive {what} from {partner_label}" if partner_label else f"Receive {what} (unresolved)"
-    else:  # NEED task
+    what = _what(node)
+
+    # ------------------------------------------------------------------
+    # LOCAL
+    # ------------------------------------------------------------------
+    if node.type == "LOCAL":
+        text = f"[LOCAL] {node.action}"
+
+    # ------------------------------------------------------------------
+    # ASK_HELP
+    # ------------------------------------------------------------------
+    elif node.type == "ASK_HELP":
         if partner_label:
-            text = f"Wait for {partner_label} to complete: {n.action}"
+            text = (
+                f"[ASK_HELP] Ask {partner_label} to {node.action}."
+            )
         else:
-            text = f"Wait for this task to be completed: {n.action} (unresolved)"
+            text = (
+                f"[ASK_HELP] Ask another robot to {node.action}."
+            )
+
+    # ------------------------------------------------------------------
+    # HELP
+    # ------------------------------------------------------------------
+    elif node.type == "HELP":
+        if partner_label:
+            text = (
+                f"[HELP] {node.action} for {partner_label}."
+            )
+        else:
+            text = f"[HELP] {node.action}."
+
+    # ------------------------------------------------------------------
+    # RECEIVE
+    # ------------------------------------------------------------------
+    elif node.type == "RECEIVE":
+        if partner_label:
+            text = (
+                f"[RECEIVE] Receive {what} from {partner_label}."
+            )
+        else:
+            text = (
+                f"[RECEIVE] Receive {what}."
+            )
+
+    # ------------------------------------------------------------------
+    # PASS
+    # ------------------------------------------------------------------
+    elif node.type == "PASS":
+        if partner_label:
+            text = (
+                f"[PASS] Pass {what} to {partner_label}."
+            )
+        else:
+            text = (
+                f"[PASS] Pass {what}."
+            )
+
+    # ------------------------------------------------------------------
+    # Backward compatibility
+    # ------------------------------------------------------------------
+    elif node.type == "NEED":
+        if partner_label:
+            text = (
+                f"[ASK_HELP] Ask {partner_label} to {node.action}."
+            )
+        else:
+            text = (
+                f"[ASK_HELP] Ask another robot to {node.action}."
+            )
+
+    else:
+        text = f"[{node.type}] {node.action}"
+
     return text, partner
 
 
-def _slots(graph: PlanGraph, report: RuleReport) -> dict[str, int]:
-    """Compute graph levels while keeping hand-off item transfer/receipt in one slot."""
-    slot = dict(report.levels)
-    succ: dict[str, list[str]] = {}
-    for e in graph.edges():
-        succ.setdefault(e.src, []).append(e.dst)
-    for nid in reversed(report.order):
-        n = graph.nodes[nid]
-        if n.type != "PASS" or n.kind != "item":
-            continue
-        need = next((k for k, p in graph.handoff.items() if p == nid), None)
-        if need is None or slot[need] <= slot[nid]:
-            continue
-        target = slot[need]
-        if all(slot[v] > target for v in succ.get(nid, []) if v != need):
-            slot[nid] = target
-    return slot
+# ============================================================================
+# step / level computation
+# ============================================================================
 
+def _steps(
+    graph: PlanGraph,
+    report: RuleReport,
+) -> dict[int, list[str]]:
+    """
+    Group active graph nodes by dependency level.
 
-def render_joint_plan(graph: PlanGraph, report: RuleReport) -> tuple[dict, str]:
-    """Return both analysis-friendly JSON and a robot-centric natural-language Joint Plan."""
-    slot_of = _slots(graph, report)
+    report.levels:
+        node_id -> topological level
 
-    # Keep the original slot representation for evaluation/debugging.
-    slots: dict[int, list[dict]] = {}
+    Example:
+        {
+            "R1_S1": 0,
+            "R2_S1": 0,
+            "R2_S2": 1,
+            "R2_S3": 2,
+            "R1_S2": 3,
+        }
+
+    becomes:
+
+        Step 1
+            R1_S1
+            R2_S1
+
+        Step 2
+            R2_S2
+
+        Step 3
+            R2_S3
+
+        Step 4
+            R1_S2
+    """
+
+    steps: dict[int, list[str]] = {}
+
     for nid in report.order:
-        text, partner = _line(graph, nid)
-        n = graph.nodes[nid]
-        slots.setdefault(slot_of[nid], []).append(
-            {"id": nid, "agent": n.agent, "type": n.type, "kind": n.kind, "partner": partner, "text": text}
-        )
 
-    # Robot-centric representation: preserve each robot's local execution order.
-    robot_steps: dict[str, list[dict]] = {}
-    robot_order: list[str] = []
-    for nid, n in graph.nodes.items():
-        if n.agent not in robot_steps:
-            robot_steps[n.agent] = []
-            robot_order.append(n.agent)
-        if n.active:
+        if nid not in graph.nodes:
+            continue
+
+        node = graph.nodes[nid]
+
+        # Inactive HELP/PASS candidates are not part of
+        # the final Joint Plan.
+        if not node.active:
+            continue
+
+        level = report.levels.get(nid)
+
+        if level is None:
+            continue
+
+        steps.setdefault(level, []).append(nid)
+
+    return steps
+
+
+# ============================================================================
+# main renderer
+# ============================================================================
+
+def render_joint_plan(
+    graph: PlanGraph,
+    report: RuleReport,
+) -> tuple[dict, str]:
+    """
+    Convert the final Dependency Graph into:
+
+        1. Joint Plan JSON
+        2. Natural-language Joint Plan
+
+    The output follows the dependency order rather than grouping
+    actions by robot.
+    """
+
+    step_groups = _steps(graph, report)
+
+    # ------------------------------------------------------------------
+    # JSON representation
+    # ------------------------------------------------------------------
+
+    step_json: list[dict] = []
+
+    for step_index, (level, node_ids) in enumerate(
+        sorted(step_groups.items()),
+        start=1,
+    ):
+
+        actions = []
+
+        for nid in node_ids:
+
+            node = graph.nodes[nid]
             text, partner = _line(graph, nid)
-            robot_steps[n.agent].append(
+
+            actions.append(
                 {
                     "id": nid,
-                    "order": n.order,
-                    "type": n.type,
-                    "kind": n.kind,
+                    "agent": node.agent,
+                    "label": _robot_label(node.agent),
+                    "type": node.type,
+                    "kind": node.kind,
+                    "action": node.action,
+                    "item": node.item,
                     "partner": partner,
                     "text": text,
                 }
             )
 
-    for agent in robot_order:
-        robot_steps[agent].sort(key=lambda x: (x["order"], x["id"]))
-
-    joint = {
-        "format": "robot_centric",
-        "robots": [
+        step_json.append(
             {
-                "agent": agent,
-                "label": _robot_label(agent),
-                "steps": steps,
+                "step": step_index,
+                "level": level,
+                "actions": actions,
             }
-            for agent, steps in ((agent, robot_steps[agent]) for agent in robot_order)
-        ],
-        "slots": [{"slot": i + 1, "steps": steps} for i, (_, steps) in enumerate(sorted(slots.items()))],
-        "unresolved_needs": [
+        )
+
+    # ------------------------------------------------------------------
+    # unresolved requests
+    # ------------------------------------------------------------------
+
+    unresolved_requests = []
+
+    for nid in report.unresolved_needs:
+
+        if nid not in graph.nodes:
+            continue
+
+        node = graph.nodes[nid]
+
+        unresolved_requests.append(
             {
                 "id": nid,
-                "agent": graph.nodes[nid].agent,
-                "action": graph.nodes[nid].action,
+                "agent": node.agent,
+                "label": _robot_label(node.agent),
+                "type": node.type,
+                "kind": node.kind,
+                "action": node.action,
+                "item": node.item,
             }
-            for nid in report.unresolved_needs
-        ],
-        "warnings": report.warnings,
+        )
+
+    # ------------------------------------------------------------------
+    # final JSON
+    # ------------------------------------------------------------------
+
+    joint = {
+        "format": "dependency_ordered",
+        "steps": step_json,
+        "unresolved_requests": unresolved_requests,
+        "warnings": list(report.warnings),
     }
 
-    lines = ["### Joint Plan", ""]
-    for robot in joint["robots"]:
-        lines.append(f"**{robot['label']}**")
-        if not robot["steps"]:
-            lines.append("1. Wait.")
-        else:
-            for i, step in enumerate(robot["steps"], start=1):
-                lines.append(f"{i}. {step['text']}")
+    # ------------------------------------------------------------------
+    # natural-language Joint Plan
+    # ------------------------------------------------------------------
+
+    lines = [
+        "### Joint Plan",
+        "",
+    ]
+
+    for step in step_json:
+
+        lines.append(f"[Step {step['step']}]")
+
+        for action in step["actions"]:
+
+            lines.append(
+                f"- [{action['label']}] {action['text']}"
+            )
+
         lines.append("")
 
-    if joint["unresolved_needs"]:
-        lines.append("**Unresolved Needs**")
-        for u in joint["unresolved_needs"]:
-            lines.append(f"- {_robot_label(u['agent'])}: {u['action']}")
+    # ------------------------------------------------------------------
+    # unresolved requests
+    # ------------------------------------------------------------------
+
+    if unresolved_requests:
+
+        lines.append("### Unresolved Requests")
+
+        for request in unresolved_requests:
+
+            what = (
+                request["item"]
+                if request["item"]
+                else request["action"]
+            )
+
+            lines.append(
+                f"- [{request['label']}] "
+                f"[{request['type']}] {what}"
+            )
+
         lines.append("")
+
+    # ------------------------------------------------------------------
+    # warnings
+    # ------------------------------------------------------------------
 
     if joint["warnings"]:
-        lines.append("**Warnings**")
-        lines.extend(f"- {w}" for w in joint["warnings"])
+
+        lines.append("### Warnings")
+
+        for warning in joint["warnings"]:
+            lines.append(f"- {warning}")
+
+        lines.append("")
 
     return joint, "\n".join(lines).rstrip()
