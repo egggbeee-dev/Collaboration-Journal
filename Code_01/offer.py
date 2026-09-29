@@ -1,4 +1,3 @@
-```python
 """Stage 1 - OFFER.
 
 Each robot independently describes ONLY task-relevant information:
@@ -667,4 +666,3 @@ async def make_offer(agent: Agent) -> Offer:
     )
 
     return agent.offer
-```
