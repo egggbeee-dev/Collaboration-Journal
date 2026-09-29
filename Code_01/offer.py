@@ -1,207 +1,363 @@
-"""Stage 1 - OFFER.
+# offer.py
 
-Every robot looks at its own images + capability + hidden info and broadcasts what it can
- do, cannot do, can provide and needs. Nobody assigns anything.
+from typing import Optional
+import json
 
-The OFFER is the robot's local negotiation interface:
-- can_do: actions the robot can execute itself
-- cannot_do: task-relevant actions it cannot execute
-- can_provide: tangible resources it can physically hand over
-- needs: concrete dependencies required to complete its own portion of the task
+from openai import OpenAI
 
-Important: a task-relevant NEED is allowed to overlap with the global task. Such overlap does
-not make it an invalid "task restatement" when the robot cannot perform that required action
-itself. The NEED expresses a capability-induced dependency that can become a P2P coordination
-candidate in the Auction stage.
-"""
-from __future__ import annotations
-
-from runtime import Agent
-from schemas import AgentInput, Offer, RawOffer
-
-# Words that make an item non-transportable even if the model calls it an "item".
-# This post-hoc check is intentionally limited to can_provide: it prevents abstract states,
-# places, or status descriptions from entering the P2P matching pool.
-NON_PASSABLE_KW = {
-    "sink", "counter", "shelf", "surface", "floor", "wall", "room", "space", "area",
-    "cleaned", "wiped", "organized", "tidied", "cleared", "arranged", "set", "setup",
-    "confirmation", "confirm", "status", "done", "ready", "complete", "completed",
-}
+from schemas import RawOffer, Offer
 
 
-def _keywords(text: str) -> set[str]:
-    import re
+# ============================================================
+# Prompt
+# ============================================================
 
-    return set(re.findall(r"[a-z0-9]+", text.lower()))
+OFFER_SYSTEM_PROMPT = """
+You are a robot generating a structured capability and collaboration offer
+for a multi-robot household task.
 
+## Environment
 
-def _is_passable(item: str) -> bool:
-    """A can_provide entry must name a physical object/resource, not a state or a place."""
-    return not bool(_keywords(item) & NON_PASSABLE_KW)
+- Multiple heterogeneous robots operate in spatially separated environments.
+- Each robot can observe only its own local environment.
+- Raw visual observations are private to each robot.
+- Robots communicate only through structured information such as Offers and Plans.
+- There is NO centralized task allocator at this stage.
+- Each robot independently determines:
+  1. what it can do,
+  2. what it cannot do,
+  3. what it can provide to other robots,
+  4. what it needs from other robots.
 
+The goal is NOT to assign the entire task to a robot.
+Instead, the Offer describes the robot's local capabilities and possible
+dependencies so that later stages can establish collaboration relations.
 
-_OFFER_EXAMPLE = """EXAMPLE - bathroom robot, global task "prepare the living room for exercise":
+## Input
+
+You will receive:
+
+- GLOBAL TASK
+- ROBOT CAPABILITY
+- LOCAL OBSERVATION
+- HIDDEN INFORMATION
+
+The robot must reason only from the provided capability and local/private
+observation.
+
+## Output
+
+Return ONLY valid JSON with exactly these fields:
+
 {
-  "capability": "Mobile robot with a light-duty arm. Can move between rooms but cannot move heavy furniture.",
-  "obs_scope": ["bathtub", "sink", "toilet", "bath mat", "trash bin"],
-  "can_do": ["pick up the bath mat", "move the trash bin"],
-  "cannot_do": ["move heavy furniture in the living room"],
-  "can_provide": ["bath mat"],
-  "needs": [
-    {"kind": "task", "text": "move heavy furniture in the living room"}
-  ]
+  "capability": "...",
+  "obs_scope": [...],
+  "can_do": [...],
+  "cannot_do": [...],
+  "can_provide": [...],
+  "needs": [...]
 }
 
-IMPORTANT:
-The NEED is intentionally similar to a part of the global task. It is valid because this robot
-cannot perform that required action itself and its own completion depends on another robot doing it.
-Do NOT remove such a NEED merely because its wording overlaps with the global task."""
+## Field definitions
 
-OFFER_SYSTEM = f"""You are one robot in a team of robots. Each robot works in a different room and can only see its own room.
-Nobody assigns work: there is no task allocator. You independently determine what you can do and what you need from other robots, based strictly on your own CAPABILITY and observations.
+### 1. capability
 
-You receive: the shared TASK, your CAPABILITY, two IMAGES of your own room, and HIDDEN INFO (facts about places you cannot see or explore). You cannot inspect other rooms while constructing this OFFER.
+Copy the robot's provided capability faithfully.
 
-{_OFFER_EXAMPLE}
+Do not add capabilities that are not explicitly given.
 
-Write your OFFER. It will be broadcast to the other robots and later used to generate local plans and P2P coordination candidates.
-Return ONE JSON object with exactly these keys:
-{{
-  "capability": string,
-  "obs_scope": [string],
-  "can_do": [string],
-  "cannot_do": [string],
-  "can_provide": [string],
-  "needs": [{{"kind": "item" | "task", "text": string}}]
-}}
+Example:
+"Fixed-base robot arm with a gripper, mounted in the kitchen.
+Cannot move from its position or leave the kitchen.
+Can only pick up and hand over items within reach in the kitchen."
 
-RULES:
+---
 
-1. CAPABILITY
-- Copy your CAPABILITY faithfully.
-- Do not claim abilities that contradict it.
-- Treat mobility, payload/weight limits, manipulation ability, and room access as real constraints.
+### 2. obs_scope
 
-2. OBS_SCOPE
-- List only objects and areas actually visible in your images or explicitly stated in HIDDEN INFO.
-- Never invent unseen objects.
-- Keep entries concrete and concise.
+List only concrete facts that the robot can observe or that are explicitly
+provided as hidden information.
 
-3. CAN_DO
-- List up to 8 concrete actions YOU can physically execute.
-- Every action must be grounded in an object or area from OBS_SCOPE.
-- Every action must be allowed by your CAPABILITY.
-- Prefer actions that directly contribute to the global task.
-- Do not include actions that require another robot.
-- Do not write vague actions such as "help with the task" or "prepare the room".
+Each item should be concise.
 
-4. CANNOT_DO
-- List only task-relevant actions that you cannot execute because of your physical capability,
-  mobility, object access, or lack of a required object.
-- Do not list every imaginable thing the robot cannot do.
-- Keep each entry as a concrete action, e.g. "move heavy furniture in the living room".
-- Do not put a task in CANNOT_DO merely because it is in another room; include it only when the
-  task is relevant and your physical constraints actually prevent you from performing it.
+Example:
+[
+  {
+    "object": "cup",
+    "location": "kitchen_table",
+    "state": "present"
+  }
+]
 
-5. CAN_PROVIDE
-- List up to 2 tangible objects/resources that are physically available to you and that you could
-  carry or hand over to another robot.
-- The object must be grounded in OBS_SCOPE or HIDDEN INFO.
-- Do NOT list states or results such as "cleaned sink", "cleared room", "organized shelf",
-  "confirmation", or "status".
-- Ask: "Could I physically bring this resource to another robot at a handoff point?"
-  If not, leave it out.
-- Only include resources that could plausibly help another robot with the global task.
+Do NOT infer information that is not provided.
 
-6. NEEDS
-A NEED is a concrete dependency required for YOUR OWN portion of the global task.
-There are two kinds:
-- kind="item": a tangible item you need to receive from another robot.
-- kind="task": a concrete task that another robot needs to perform because YOU cannot perform it.
+---
 
-CRITICAL DISTINCTION:
-- A NEED is NOT invalid just because its wording overlaps with the global TASK.
-- If the global task requires an action and your capability prevents you from doing that action,
-  represent that action as a NEED/task.
-- Example:
-    CANNOT_DO: "move heavy furniture in the living room"
-    NEED: {{"kind":"task", "text":"move heavy furniture in the living room"}}
-- This expresses a capability-induced dependency and is exactly the kind of dependency that may
-  later be matched with another robot's PASS/task offer.
-- Do NOT create a NEED merely because another robot could do something or because another room is
-  involved. Your own completion must genuinely depend on it.
-- Do NOT create a NEED for something you can already do yourself.
-- Do NOT assign a specific robot in the NEED. The Auction decides who, if anyone, matches it.
-- Keep each NEED short, concrete, and actionable.
+### 3. can_do
 
-7. COLLABORATION
-Think about the boundary between your local plan and P2P coordination:
-- What can I execute locally?
-- What tangible resource can I hand over?
-- What required action can I NOT execute?
-- Which missing item or external task genuinely blocks my own completion?
+List concrete actions the robot can perform that directly contribute to
+the GLOBAL TASK.
 
-8. CONSISTENCY
-Before returning JSON, check:
-- Every CAN_DO action is physically feasible.
-- Every CAN_PROVIDE item is physically available and transportable.
-- Every NEED is necessary for your own portion of the task.
-- A NEED does not duplicate an action already in CAN_DO.
-- CANNOT_DO reflects an actual limitation rather than a generic statement.
-- A task-relevant NEED may overlap semantically with the global TASK; do not delete it for that reason.
+Each action must be represented as a structured object.
 
-9. OUTPUT
-- Return ONLY valid JSON inside <JSON> tags.
-- Do not include explanations outside the JSON.
+Example:
+[
+  {
+    "action": "pick_up",
+    "object": "cup",
+    "location": "kitchen_table"
+  },
+  {
+    "action": "hand_over",
+    "object": "cup",
+    "target": "another_robot"
+  }
+]
 
-<JSON>
-{{
-  "capability": "...",
-  "obs_scope": ["..."],
-  "can_do": ["..."],
-  "cannot_do": ["..."],
-  "can_provide": ["..."],
-  "needs": [
-    {{"kind": "item", "text": "..."}},
-    {{"kind": "task", "text": "..."}}
-  ]
-}}
-</JSON>"""
+Rules:
+
+- Actions must be physically possible for this robot.
+- Actions must be grounded in the robot's capability and observation.
+- Do not include actions that require another robot to perform them.
+- Do not invent objects, locations, or capabilities.
+- Do not list generic capabilities that are unrelated to the GLOBAL TASK.
+
+---
+
+### 4. cannot_do
+
+List task-relevant actions that the robot cannot perform because of its
+physical capability or environment constraints.
+
+Each item should be structured.
+
+Example:
+[
+  {
+    "action": "move_to",
+    "location": "living_room",
+    "reason": "fixed_base"
+  }
+]
+
+Do not list every imaginable action.
+Only include limitations that are relevant to the GLOBAL TASK.
+
+---
+
+### 5. can_provide
+
+List concrete resources, objects, or task contributions that this robot can
+provide to another robot.
+
+Each item should be structured.
+
+Example:
+[
+  {
+    "type": "item",
+    "object": "cup",
+    "location": "kitchen_table"
+  }
+]
+
+or
+
+[
+  {
+    "type": "task",
+    "action": "pick_up",
+    "object": "cup"
+  }
+]
+
+Only include things that the robot can actually provide based on its
+capability and local observation.
+
+---
+
+### 6. needs
+
+List concrete dependencies that the robot may require from another robot
+in order to accomplish the GLOBAL TASK.
+
+Each need must be structured.
+
+Example:
+
+[
+  {
+    "kind": "task",
+    "action": "move",
+    "object": "heavy_table",
+    "location": "living_room"
+  }
+]
+
+or
+
+[
+  {
+    "kind": "item",
+    "object": "cup",
+    "location": "kitchen"
+  }
+]
+
+Rules:
+
+- A need must represent a concrete dependency.
+- Do not assign a specific robot.
+- Do not rewrite the entire GLOBAL TASK as a need.
+- Only include a need when the robot cannot satisfy that dependency itself.
+- If the robot can complete the task without external help, return [].
+
+## Important principles
+
+1. Stay grounded in the provided capability and local observation.
+2. Never invent objects, locations, or robot capabilities.
+3. Do not assign tasks to other robots.
+4. Do not decide final collaboration partners.
+5. Do not generate a global plan.
+6. The Offer describes what this robot can contribute and what it may need.
+7. Return JSON only.
+"""
 
 
-def build_offer_user(inp: AgentInput) -> str:
-    hidden = "\n".join(f"- {h}" for h in inp.hidden_info) or "- (none)"
-    return (
-        f"TASK: {inp.task}\n\nCAPABILITY: {inp.capability}\n\nHIDDEN INFO:\n{hidden}\n\n"
-        "The attached images show your own room. Base OBS_SCOPE, CAN_DO and CAN_PROVIDE only on "
-        "what you see here plus HIDDEN INFO, filtered through what your CAPABILITY allows. "
-        "For NEEDS, reason about what your own portion of the global task genuinely depends on."
+# ============================================================
+# Offer Generation
+# ============================================================
+
+def generate_offer(
+    client: OpenAI,
+    agent_id: str,
+    task: str,
+    capability: str,
+    observation: Optional[list] = None,
+    hidden_info: Optional[list] = None,
+    model: str = "gpt-4o",
+) -> Offer:
+
+    observation = observation or []
+    hidden_info = hidden_info or []
+
+    user_prompt = f"""
+GLOBAL TASK:
+{task}
+
+ROBOT ID:
+{agent_id}
+
+ROBOT CAPABILITY:
+{capability}
+
+LOCAL OBSERVATION:
+{json.dumps(observation, ensure_ascii=False, indent=2)}
+
+HIDDEN INFORMATION:
+{json.dumps(hidden_info, ensure_ascii=False, indent=2)}
+
+Generate this robot's Offer.
+
+Remember:
+- Use only the provided capability and local/private information.
+- Do not assign another robot.
+- Do not generate a global plan.
+- Identify concrete actions this robot can perform.
+- Identify relevant actions it cannot perform.
+- Identify concrete resources or contributions it can provide.
+- Identify concrete dependencies it needs from other robots.
+- Return ONLY valid JSON.
+"""
+
+    response = client.chat.completions.create(
+        model=model,
+        temperature=0,
+        response_format={"type": "json_object"},
+        messages=[
+            {
+                "role": "system",
+                "content": OFFER_SYSTEM_PROMPT,
+            },
+            {
+                "role": "user",
+                "content": user_prompt,
+            },
+        ],
     )
 
+    raw = json.loads(response.choices[0].message.content)
 
-async def make_offer(agent: Agent) -> Offer:
-    raw: RawOffer = await agent.ask(
-        "offer", OFFER_SYSTEM, build_offer_user(agent.inp), RawOffer.model_validate, banner_label="OFFER RAW"
+    # --------------------------------------------------------
+    # Basic normalization
+    # --------------------------------------------------------
+
+    raw.setdefault("capability", capability)
+    raw.setdefault("obs_scope", [])
+    raw.setdefault("can_do", [])
+    raw.setdefault("cannot_do", [])
+    raw.setdefault("can_provide", [])
+    raw.setdefault("needs", [])
+
+    # Agent ID is added after LLM generation.
+    offer = Offer(
+        agent=agent_id,
+        capability=raw["capability"],
+        obs_scope=raw["obs_scope"],
+        can_do=raw["can_do"],
+        cannot_do=raw["cannot_do"],
+        can_provide=raw["can_provide"],
+        needs=raw["needs"],
     )
 
-    # Keep the deterministic physical-passability guard for can_provide.
-    # Do NOT filter needs by lexical overlap with the global task: a capability-induced task
-    # dependency can legitimately use nearly the same wording as the global task.
-    kept = [p for p in raw.can_provide if _is_passable(p)]
-    dropped = [p for p in raw.can_provide if not _is_passable(p)]
-    if dropped:
-        agent.log.log("offer", agent.id, "can_provide_filtered", dropped=dropped)
-        if agent.verbose:
-            print(f"  [OFFER FILTER] {agent.id}: non-passable can_provide dropped: {dropped}")
+    return offer
 
-    raw = raw.model_copy(update={"can_provide": kept})
 
-    agent.offer = Offer(agent=agent.id, **raw.model_dump())
-    if agent.verbose:
-        print(
-            f"  [OFFER] {agent.id}: obs_scope={len(agent.offer.obs_scope)} can_do={len(agent.offer.can_do)} "
-            f"can_provide={agent.offer.can_provide} needs={[n.text for n in agent.offer.needs]}"
-        )
-    agent.log.log("offer", agent.id, "offer_made", n_needs=len(agent.offer.needs), n_provide=len(agent.offer.can_provide))
-    agent.bus.broadcast(agent.id, "offer", agent.offer.model_dump(), phase="offer")
-    return agent.offer
+# ============================================================
+# Example
+# ============================================================
+
+if __name__ == "__main__":
+
+    client = OpenAI()
+
+    task = """
+Prepare breakfast for two people.
+The table in the living room must be prepared with cups and plates.
+"""
+
+    capability = (
+        "Fixed-base robot arm with a gripper, mounted in the kitchen. "
+        "Cannot move from its position or leave the kitchen. "
+        "Can only pick up and hand over items within reach in the kitchen."
+    )
+
+    observation = [
+        {
+            "object": "cup",
+            "location": "kitchen_table",
+            "state": "present"
+        },
+        {
+            "object": "plate",
+            "location": "kitchen_table",
+            "state": "present"
+        }
+    ]
+
+    hidden_info = []
+
+    offer = generate_offer(
+        client=client,
+        agent_id="R1",
+        task=task,
+        capability=capability,
+        observation=observation,
+        hidden_info=hidden_info,
+    )
+
+    print(json.dumps(
+        offer.model_dump(),
+        ensure_ascii=False,
+        indent=2
+    ))
