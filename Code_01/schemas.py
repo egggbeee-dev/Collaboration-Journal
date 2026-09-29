@@ -1,29 +1,27 @@
 """JSON schemas for the messages that flow through the pipeline.
 
-Step types:
+Stage 1 - OFFER
+    Each robot independently describes:
+    - what it can do
+    - what it cannot do
+    - what it can provide
+    - what it needs
 
-    LOCAL
-        Perform an action independently.
+Stage 2 - LOCAL PLANNING
+    Each robot constructs a local plan using:
+    - LOCAL
+    - ASK_HELP
+    - HELP
+    - RECEIVE
+    - PASS
 
-    ASK_HELP
-        Request another robot to perform a task.
+Stage 3 - AUCTION
+    Candidate collaboration edges are generated:
+        ASK_HELP <-> HELP
+        RECEIVE  <-> PASS
 
-    HELP
-        Perform a task requested by another robot.
-
-    RECEIVE
-        Receive a physical item from another robot.
-
-    PASS
-        Provide/pass a physical item to another robot.
-
-Collaboration pairings:
-
-    ASK_HELP <-> HELP
-    RECEIVE  <-> PASS
-
-The `target` field is only a non-binding preferred target.
-The Auction and Graph Reasoning stages determine the final collaboration relation.
+The Auction and Graph Reasoning stages determine
+the final collaboration relations.
 """
 
 from __future__ import annotations
@@ -33,9 +31,9 @@ from typing import Literal, Optional
 from pydantic import BaseModel, Field, model_validator
 
 
-# ---------------------------------------------------------------------------
-# Step types
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Basic types
+# ===========================================================================
 
 StepType = Literal[
     "LOCAL",
@@ -45,12 +43,15 @@ StepType = Literal[
     "PASS",
 ]
 
-Kind = Literal["item", "task"]
+Kind = Literal[
+    "item",
+    "task",
+]
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 # Input
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
 class AgentInput(BaseModel):
     """What one robot receives.
@@ -96,32 +97,146 @@ class TaskConfig(BaseModel):
         return {
             f"agent_{i}": AgentInput(
                 task=self.task,
-                **a,
+                **agent,
             )
-            for i, a in enumerate(
+            for i, agent in enumerate(
                 self.agents,
                 start=1,
             )
         }
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 # Offer
-# ---------------------------------------------------------------------------
+# ===========================================================================
+
+class ObsObject(BaseModel):
+    """An object or area observed by the robot."""
+
+    object: str
+
+    location: str
+
+    state: Optional[str] = None
+
+
+class CanDoAction(BaseModel):
+    """A concrete action the robot can physically perform."""
+
+    action: str
+
+    object: Optional[str] = None
+
+    location: Optional[str] = None
+
+    target: Optional[str] = None
+
+
+class CannotDoAction(BaseModel):
+    """A task-relevant action the robot cannot perform."""
+
+    action: str
+
+    object: Optional[str] = None
+
+    location: Optional[str] = None
+
+    reason: str
+
+
+class CanProvide(BaseModel):
+    """A task or physical item that the robot can provide.
+
+    type="task"
+        A task that another robot could request this robot to perform.
+
+    type="item"
+        A physical item/resource that another robot could receive.
+    """
+
+    type: Kind
+
+    object: Optional[str] = None
+
+    location: Optional[str] = None
+
+    action: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _validate_provide(self):
+        # ---------------------------------------------------------------
+        # TASK
+        # ---------------------------------------------------------------
+        if self.type == "task":
+            if not self.action:
+                raise ValueError(
+                    "CanProvide(type='task') requires 'action'."
+                )
+
+            # A task does not need a physical object.
+            self.object = None
+
+            return self
+
+        # ---------------------------------------------------------------
+        # ITEM
+        # ---------------------------------------------------------------
+        if self.type == "item":
+            if not self.object:
+                raise ValueError(
+                    "CanProvide(type='item') requires 'object'."
+                )
+
+            return self
+
+        return self
+
 
 class OfferNeed(BaseModel):
-    """A need declared in an Offer.
+    """A genuine dependency declared in an Offer.
 
-    `kind="task"`:
+    kind="task"
         The robot needs another robot to perform a task.
 
-    `kind="item"`:
+    kind="item"
         The robot needs another robot to provide an item.
     """
 
     kind: Kind
 
-    text: str
+    object: Optional[str] = None
+
+    location: Optional[str] = None
+
+    action: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _validate_need(self):
+        # ---------------------------------------------------------------
+        # TASK
+        # ---------------------------------------------------------------
+        if self.kind == "task":
+            if not self.action:
+                raise ValueError(
+                    "OfferNeed(kind='task') requires 'action'."
+                )
+
+            self.object = None
+
+            return self
+
+        # ---------------------------------------------------------------
+        # ITEM
+        # ---------------------------------------------------------------
+        if self.kind == "item":
+            if not self.object:
+                raise ValueError(
+                    "OfferNeed(kind='item') requires 'object'."
+                )
+
+            return self
+
+        return self
 
 
 class RawOffer(BaseModel):
@@ -129,19 +244,19 @@ class RawOffer(BaseModel):
 
     capability: str
 
-    obs_scope: list[str] = Field(
+    obs_scope: list[ObsObject] = Field(
         default_factory=list
     )
 
-    can_do: list[str] = Field(
+    can_do: list[CanDoAction] = Field(
         default_factory=list
     )
 
-    cannot_do: list[str] = Field(
+    cannot_do: list[CannotDoAction] = Field(
         default_factory=list
     )
 
-    can_provide: list[str] = Field(
+    can_provide: list[CanProvide] = Field(
         default_factory=list
     )
 
@@ -159,12 +274,30 @@ class Offer(RawOffer):
     agent: str
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 # Local Plan
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
 class RawStep(BaseModel):
-    """One local-plan step generated by the LLM."""
+    """One local-plan step generated by the LLM.
+
+    Step semantics:
+
+    LOCAL
+        Perform an action independently.
+
+    ASK_HELP
+        Request another robot to perform a task.
+
+    HELP
+        Perform a task requested by another robot.
+
+    RECEIVE
+        Receive a physical item from another robot.
+
+    PASS
+        Provide/pass a physical item to another robot.
+    """
 
     type: StepType
 
@@ -177,17 +310,19 @@ class RawStep(BaseModel):
     item: Optional[str] = None
 
     target: Optional[str] = None
+
     # Preferred target only.
-    # Final assignment is determined later by Auction / Graph Reasoning.
+    # Final assignment is determined by Auction / Graph Reasoning.
 
     @model_validator(mode="after")
     def _validate_step(self):
+
         # ---------------------------------------------------------------
         # LOCAL
         # ---------------------------------------------------------------
+
         if self.type == "LOCAL":
 
-            # LOCAL does not represent collaboration.
             self.kind = None
             self.item = None
             self.target = None
@@ -197,12 +332,12 @@ class RawStep(BaseModel):
         # ---------------------------------------------------------------
         # ASK_HELP / HELP
         # ---------------------------------------------------------------
+
         if self.type in {
             "ASK_HELP",
             "HELP",
         }:
 
-            # These are task-level collaboration relations.
             if self.kind is None:
                 self.kind = "task"
 
@@ -212,7 +347,7 @@ class RawStep(BaseModel):
                     f"{self.action!r}"
                 )
 
-            # No physical item is associated with task-level help.
+            # Task-level collaboration does not carry a physical item.
             self.item = None
 
             return self
@@ -220,12 +355,12 @@ class RawStep(BaseModel):
         # ---------------------------------------------------------------
         # RECEIVE / PASS
         # ---------------------------------------------------------------
+
         if self.type in {
             "RECEIVE",
             "PASS",
         }:
 
-            # These are physical item-transfer relations.
             if self.kind is None:
                 self.kind = "item"
 
@@ -250,10 +385,6 @@ class RawLocalPlan(BaseModel):
     """Raw local plan generated by one robot.
 
     Empty plans are valid.
-
-    Example:
-        A fixed-base kitchen robot may have no relevant action
-        for a living-room-only task.
     """
 
     steps: list[RawStep] = Field(
@@ -358,7 +489,7 @@ class LocalPlan(BaseModel):
         ]
 
     # -------------------------------------------------------------------
-    # Provider steps
+    # Providers
     # -------------------------------------------------------------------
 
     def provider_steps(self) -> list[Step]:
@@ -410,9 +541,9 @@ class LocalPlan(BaseModel):
         ]
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 # Utility
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
 def agent_of(step_id: str) -> str:
     """Convert a step ID to its agent ID.
@@ -424,9 +555,9 @@ def agent_of(step_id: str) -> str:
     return f"agent_{step_id.split('-')[0]}"
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 # Debug / configuration description
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
 def describe_config(
     config: TaskConfig,
