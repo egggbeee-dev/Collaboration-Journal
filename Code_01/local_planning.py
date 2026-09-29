@@ -1,29 +1,26 @@
 """Stage 2 - LOCAL PLANNING.
 
-Every robot plans for itself. It reads ALL broadcast Offers, creates LOCAL / HELP / PASS / RECEIVE intents, and may attach preferred targets as non-binding coordination hints.
-A robot that can do something another robot asked for volunteers by writing a PASS/task
-step into its OWN plan.
+Each robot independently constructs its own local plan.
 
-Prompt design notes (informed by the KCC 2-agent pilot, p2p_phase.py phase2_local_plan):
-- The single most common failure mode observed in practice: a robot does something that
-  another robot explicitly asked for (in that other robot's `needs`), but does it as a plain
-  LOCAL step instead of a PASS step. A LOCAL step is invisible outside that robot's own plan,
-  so the Auction has nothing to match the other robot's NEED against, and that NEED silently
-  ends up unmatched even though the work actually got done. The prompt below calls this out
-  explicitly and requires a visible PASS/task step whenever this happens - "doing it" is not
-  enough, the robot must also *announce* it as PASS so it can be matched.
-- Second most common failure mode: a robot volunteers for one need but decomposes its own
-  execution into many small PASS steps (one per object it happens to move) instead of one
-  PASS step for the need itself. Since Auction matching is 1:1, only one of those PASS steps
-  can ever be used - the rest are silently dropped, and work that was actually planned
-  disappears from the final joint plan without any error being raised.
-- Third failure mode: a PASS step phrased as a request ("Request agent_2 to move the...")
-  has the direction backwards - it should be a NEED. Left as PASS it can never validly match
-  anything, so the real request silently disappears. `_fix_reversed_handoffs` catches this
-  in code after parsing, since prompting alone did not reliably prevent it.
-- Every rule is phrased in terms of CAPABILITY, not just "if you can" - because a plan that
-  ignores capability limits produces steps the Graph's rule checks (or physical execution)
-  would reject anyway.
+Step types:
+
+    LOCAL
+        Perform the action locally.
+
+    ASK_HELP
+        Ask another robot to perform a task.
+
+    HELP
+        Perform a task requested by another robot.
+
+    RECEIVE
+        Receive a physical item from another robot.
+
+    PASS
+        Pass a physical item to another robot.
+
+The Local Plan does NOT finalize global coordination.
+It exposes collaboration intents that are later processed by Auction.
 """
 
 from __future__ import annotations
@@ -32,140 +29,487 @@ import json
 import re
 
 from runtime import Agent
-from schemas import AgentInput, LocalPlan, Offer, RawLocalPlan
+from schemas import (
+    AgentInput,
+    LocalPlan,
+    Offer,
+    RawLocalPlan,
+)
 
 
-_LOCAL_PLAN_EXAMPLE = """EXAMPLE - bedroom robot. Other robots broadcast these needs:
-- agent_1 needs (task): clear space in the living room
-- agent_3 needs (task): move heavy furniture
+# ---------------------------------------------------------------------------
+# example
+# ---------------------------------------------------------------------------
 
-Your capability allows moving furniture. A good local plan may be:
+_LOCAL_PLAN_EXAMPLE = """
+EXAMPLE
+
+Global task:
+"Prepare the living room for exercise."
+
+Your capability:
+"Mobile robot that can move heavy furniture."
+
+Another robot's OFFER contains:
+
 {
-  "steps": [
-    {"type": "LOCAL", "action": "Move the dining table and chairs to the side"},
-    {"type": "PASS", "action": "Clear space in the living room by moving heavy furniture", "kind": "task", "item": null, "target": "agent_1"}
+  "needs": [
+    {
+      "kind": "task",
+      "action": "move heavy table",
+      "location": "living room"
+    }
   ]
 }
 
-Here, target is a PREFERRED TARGET inferred from the broadcast offers. It is not a final assignment.
-Auction may confirm this match, change it, or leave it unresolved."""
+and:
+
+{
+  "can_provide": [
+    {
+      "type": "item",
+      "object": "yoga mat",
+      "location": "bedroom"
+    }
+  ]
+}
+
+A valid local plan is:
+
+{
+  "steps": [
+    {
+      "type": "LOCAL",
+      "action": "Move the chair aside"
+    },
+    {
+      "type": "HELP",
+      "action": "Move the heavy table",
+      "kind": "task",
+      "item": null,
+      "target": "agent_1"
+    },
+    {
+      "type": "PASS",
+      "action": "Give the yoga mat to agent_1",
+      "kind": "item",
+      "item": "yoga mat",
+      "target": "agent_1"
+    }
+  ]
+}
+
+If YOU cannot move the heavy table yourself:
+
+{
+  "type": "ASK_HELP",
+  "action": "Move the heavy table",
+  "kind": "task",
+  "item": null,
+  "target": null
+}
+
+If YOU need a yoga mat from another robot:
+
+{
+  "type": "RECEIVE",
+  "action": "Receive the yoga mat",
+  "kind": "item",
+  "item": "yoga mat",
+  "target": null
+}
+"""
 
 
-LOCAL_PLAN_SYSTEM = f"""You are one robot in a team of heterogeneous robots. Each robot plans for itself.
+# ---------------------------------------------------------------------------
+# system prompt
+# ---------------------------------------------------------------------------
 
-You receive the shared TASK, your own CAPABILITY, two IMAGES of your own room, HIDDEN INFO, your own OFFER, and the OFFERS broadcast by ALL other robots. Raw observations remain private: use only your own images and hidden information for physical facts about your room.
+LOCAL_PLAN_SYSTEM = f"""
+You are one robot in a team of heterogeneous robots.
+
+Each robot works in a different room and has access only to its own
+observations.
+
+Nobody assigns tasks to you.
+
+You must construct YOUR OWN local plan based on:
+- the shared TASK
+- your CAPABILITY
+- your own images
+- HIDDEN INFO
+- your own OFFER
+- other robots' OFFERS
 
 {_LOCAL_PLAN_EXAMPLE}
 
-Generate YOUR OWN ordered local plan. Return ONE JSON object:
+Return exactly ONE JSON object:
+
 {{
   "steps": [
     {{
-      "type": "LOCAL" | "NEED" | "PASS",
-      "action": string,
-      "kind": "item" | "task" | null,
-      "item": string | null,
-      "target": string | null
+      "type": "LOCAL" | "ASK_HELP" | "HELP" | "RECEIVE" | "PASS",
+      "action": "...",
+      "kind": "task" | "item" | null,
+      "item": "..." | null,
+      "target": "agent_X" | null
     }}
   ]
 }}
 
-SEMANTICS
-- LOCAL: a task you perform yourself using your own capability and private observation.
-- NEED + task: a collaboration request for a task you cannot perform. In the final rendering this is [HELP].
-- NEED + item: you need to receive a physical item from another robot. In the final rendering this is [RECEIVE].
-- PASS + task: you volunteer to perform a task explicitly needed by another robot, when your capability supports it.
-- PASS + item: you offer to provide an item that another robot explicitly needs and that you can provide.
+==================================================
+STEP TYPES
+==================================================
 
-OFFER-AWARE PLANNING — follow these three questions:
-1. What does the global TASK require from MY robot/room specifically?
-2. What can I provide to OTHER robots? Check every other robot's OFFER `needs` against my capability, `can_do`, and `can_provide`. If I can satisfy a concrete need, create a visible PASS step rather than silently doing it as LOCAL.
-3. What do I need from OTHER robots? Use my OFFER `needs` and the global task. If I cannot perform a required task, create NEED/task ([HELP]). If I need a physical object, create NEED/item ([RECEIVE]).
+1. LOCAL
 
-COLLABORATION RULES
-1. A PASS may be created ONLY when there is a concrete matching need in another robot's broadcast OFFER. Do not invent a need.
-2. A PASS must be supported by your declared CAPABILITY / `can_do` / `can_provide`. Never volunteer for a task your capability cannot perform.
-3. One PASS represents one collaboration request/need, not one PASS per object or sub-action. If satisfying "clear space" requires moving a table, chairs, and sofa, keep these actions summarized inside ONE PASS/task rather than creating several competing PASSes for the same need.
-4. A target is a PREFERRED TARGET, not a final allocation. You MAY set `target` to the robot whose OFFER explicitly contains the need you are addressing. If several robots have compatible needs, choose the most semantically compatible one as your preferred target; Auction will make the final assignment.
-5. For HELP/NEED, you MAY set `target` to a preferred helper when another robot's OFFER clearly provides the required capability. This is only a preference/hint; Auction can change or reject it. Do not phrase the action as “Request agent_X...” or “Ask agent_X...”.
-6. For RECEIVE/NEED-item, you MAY set a preferred provider when another robot's OFFER explicitly lists the needed item in `can_provide`. Again, this is not binding.
-7. Do not choose a target merely because that robot exists. The preferred target must be justified by the broadcast OFFER compatibility.
-8. If no suitable target is identifiable from the broadcast Offers, use `target: null`.
-9. Do not write steps for another robot. PASS describes what YOU will provide; NEED describes what YOU require.
-10. Use only objects visible in your own images or stated in your HIDDEN INFO. Never invent room objects.
-11. Keep the plan concise and ordered by execution. Respect any time limit in the TASK.
-12. Return JSON only."""
+Perform an action yourself.
 
+Use LOCAL when:
+- you can physically perform the action
+- the action is part of your own contribution
+- no collaboration is required
+
+Example:
+
+{{
+  "type": "LOCAL",
+  "action": "Move the chair away from the exercise area",
+  "kind": null,
+  "item": null,
+  "target": null
+}}
+
+
+2. ASK_HELP
+
+Ask another robot to perform a TASK that you cannot perform.
+
+Use ASK_HELP when:
+- the task is necessary for your own contribution
+- your capability prevents you from doing it
+- another robot may potentially be able to do it
+
+Example:
+
+{{
+  "type": "ASK_HELP",
+  "action": "Move the heavy table",
+  "kind": "task",
+  "item": null,
+  "target": null
+}}
+
+Do NOT assign a specific robot unless there is a strong reason.
+The target is only a hint.
+
+
+3. HELP
+
+Perform a TASK that another robot needs.
+
+Use HELP when:
+- another robot's OFFER indicates a task dependency
+- you can physically perform that task
+- the task is something you can contribute to another robot
+
+Example:
+
+{{
+  "type": "HELP",
+  "action": "Move the heavy table",
+  "kind": "task",
+  "item": null,
+  "target": "agent_1"
+}}
+
+IMPORTANT:
+
+HELP is the opposite side of ASK_HELP.
+
+ASK_HELP:
+    "I need someone to do this."
+
+HELP:
+    "I will do this for you."
+
+
+4. RECEIVE
+
+Receive a PHYSICAL ITEM from another robot.
+
+Use RECEIVE when:
+- you need an item for your own contribution
+- the item is not locally available
+- another robot may possess or provide it
+
+Example:
+
+{{
+  "type": "RECEIVE",
+  "action": "Receive the yoga mat",
+  "kind": "item",
+  "item": "yoga mat",
+  "target": null
+}}
+
+RECEIVE is NOT used for task-level assistance.
+
+
+5. PASS
+
+Pass a PHYSICAL ITEM to another robot.
+
+Use PASS when:
+- another robot needs an item
+- you can provide that item
+- the item is physically available to you
+
+Example:
+
+{{
+  "type": "PASS",
+  "action": "Give the yoga mat to agent_1",
+  "kind": "item",
+  "item": "yoga mat",
+  "target": "agent_1"
+}}
+
+PASS is NOT used for task-level assistance.
+
+==================================================
+PAIRING RULES
+==================================================
+
+There are exactly two collaboration pairs:
+
+    ASK_HELP ↔ HELP
+
+    RECEIVE ↔ PASS
+
+
+ASK_HELP and HELP represent TASK collaboration.
+
+RECEIVE and PASS represent ITEM transfer.
+
+Do NOT mix these meanings.
+
+==================================================
+IMPORTANT RULE - HELP VISIBILITY
+==================================================
+
+Before writing a LOCAL step, inspect the other robots' OFFERS.
+
+If another robot needs a task that you can perform,
+represent your contribution as HELP rather than LOCAL.
+
+Why?
+
+A LOCAL step is visible only inside your own local plan.
+
+A HELP step explicitly exposes the collaboration relation
+to the Auction.
+
+Example:
+
+Other robot:
+    needs = "move heavy table"
+
+You can move heavy furniture.
+
+Correct:
+
+    HELP:
+        "Move the heavy table"
+
+Incorrect:
+
+    LOCAL:
+        "Move the heavy table"
+
+==================================================
+IMPORTANT RULE - PASS VISIBILITY
+==================================================
+
+Before writing a LOCAL step involving an item that another robot
+needs, check the other robots' needs.
+
+If you are providing that item to another robot,
+represent it as PASS rather than LOCAL.
+
+Example:
+
+Other robot needs:
+    item = "yoga mat"
+
+You possess:
+    yoga mat
+
+Correct:
+
+    PASS:
+        "Give the yoga mat to agent_2"
+
+Do NOT represent this simply as LOCAL:
+    "Pick up the yoga mat"
+
+The transfer relationship must be explicitly exposed.
+
+==================================================
+IMPORTANT RULE - OWN NEEDS
+==================================================
+
+If your own OFFER contains:
+
+kind = task
+
+and you cannot perform that task:
+
+    ASK_HELP
+
+If your own OFFER contains:
+
+kind = item
+
+and you need that physical object:
+
+    RECEIVE
+
+Thus:
+
+Offer.need(task)
+    ↓
+ASK_HELP
+
+Offer.need(item)
+    ↓
+RECEIVE
+
+==================================================
+IMPORTANT RULE - CAPABILITY
+==================================================
+
+Only generate HELP when your own capability supports the requested task.
+
+Only generate PASS when the item is physically available to you.
+
+Never volunteer for an action that violates your capability.
+
+==================================================
+IMPORTANT RULE - NO GLOBAL REPLANNING
+==================================================
+
+You are NOT responsible for assigning the entire global task.
+
+Do not rewrite another robot's plan.
+
+Do not create steps for another robot.
+
+Only create YOUR OWN steps.
+
+==================================================
+TARGET
+==================================================
+
+target is only a non-binding hint.
+
+For:
+    ASK_HELP
+    RECEIVE
+
+target can normally be null.
+
+For:
+    HELP
+    PASS
+
+target may contain the robot you expect to help.
+
+The Auction will determine the actual collaboration edge.
+
+==================================================
+OUTPUT
+==================================================
+
+Return JSON only.
+"""
+
+
+# ---------------------------------------------------------------------------
+# user prompt
+# ---------------------------------------------------------------------------
 
 def build_local_plan_user(
     inp: AgentInput,
     own_offer: Offer,
     others: dict[str, Offer],
 ) -> str:
-    hidden = "\n".join(f"- {h}" for h in inp.hidden_info) or "- (none)"
+
+    hidden = (
+        "\n".join(
+            f"- {h}"
+            for h in inp.hidden_info
+        )
+        or "- (none)"
+    )
 
     others_txt = json.dumps(
         {
-            a: o.model_dump()
-            for a, o in sorted(others.items())
+            agent: offer.model_dump()
+            for agent, offer in sorted(others.items())
         },
         ensure_ascii=False,
         indent=2,
     )
 
-    other_needs = [
-        (a, n.kind, n.text)
-        for a, o in sorted(others.items())
-        for n in o.needs
-    ]
-
-    needs_reminder = (
-        "\n".join(
-            f"- {a} needs ({kind}): {text}"
-            for a, kind, text in other_needs
-        )
-        if other_needs
-        else "- (nobody has an outstanding need)"
-    )
-
     return (
-        f"TASK: {inp.task}\n\n"
-        f"YOU ARE: {own_offer.agent}\n"
-        f"CAPABILITY: {inp.capability}\n\n"
+        f"TASK:\n{inp.task}\n\n"
+        f"YOU ARE:\n{own_offer.agent}\n\n"
+        f"CAPABILITY:\n{inp.capability}\n\n"
         f"HIDDEN INFO:\n{hidden}\n\n"
         f"YOUR OFFER:\n"
         f"{json.dumps(own_offer.model_dump(), ensure_ascii=False, indent=2)}\n\n"
-        f"OTHER ROBOTS' OFFERS:\n{others_txt}\n\n"
-        f"OTHER ROBOTS' OUTSTANDING NEEDS "
-        f"(check before writing any LOCAL step):\n"
-        f"{needs_reminder}\n\n"
-        "The attached images show your own room."
+        f"OTHER ROBOTS' OFFERS:\n"
+        f"{others_txt}\n\n"
+        "Construct only YOUR OWN local plan."
     )
 
 
+# ---------------------------------------------------------------------------
+# simple text overlap
+# ---------------------------------------------------------------------------
+
 def _token_set(text: str) -> set[str]:
-    return set(re.findall(r"[a-z0-9]+", text.lower()))
+    return set(
+        re.findall(
+            r"[a-z0-9]+",
+            text.lower(),
+        )
+    )
 
 
 def _overlap(a: str, b: str) -> float:
-    aa, bb = _token_set(a), _token_set(b)
+    aa = _token_set(a)
+    bb = _token_set(b)
 
     if not aa or not bb:
         return 0.0
 
-    return len(aa & bb) / max(1, min(len(aa), len(bb)))
+    return len(aa & bb) / max(
+        1,
+        min(len(aa), len(bb)),
+    )
 
+
+# ---------------------------------------------------------------------------
+# consistency checks
+# ---------------------------------------------------------------------------
 
 def _plan_consistency_checks(
     agent: Agent,
     plan: LocalPlan,
 ) -> list[dict]:
-    """Non-destructive checks between the broadcast Offer and Local Plan.
 
-    These are warnings rather than hard filters: natural-language capability descriptions
-    are too open-ended for a lexical rule to prove physical feasibility. The purpose is to
-    expose LLM drift in experiments instead of silently changing the plan.
-    """
     warnings: list[dict] = []
 
     own = agent.offer
@@ -173,54 +517,134 @@ def _plan_consistency_checks(
     if own is None:
         return warnings
 
-    other_needs = [
-        (aid, n)
-        for aid, o in agent.others_offers.items()
-        for n in o.needs
-    ]
+    # ---------------------------------------------------------------
+    # collect other robots' needs
+    # ---------------------------------------------------------------
 
-    for step in plan.steps:
-        if step.type != "PASS" or step.kind != "task":
-            continue
+    other_needs = []
 
-        matched_need = None
+    for aid, offer in agent.others_offers.items():
+        for need in offer.needs:
+            other_needs.append(
+                (
+                    aid,
+                    need,
+                )
+            )
+
+    # ---------------------------------------------------------------
+    # check HELP
+    # ---------------------------------------------------------------
+
+    for step in plan.help_steps():
+
+        candidates = []
 
         for aid, need in other_needs:
+
+            if need.kind != "task":
+                continue
+
+            need_text = " ".join(
+                x
+                for x in [
+                    need.action,
+                    need.object,
+                    need.location,
+                ]
+                if x
+            )
+
+            score = _overlap(
+                step.action,
+                need_text,
+            )
+
             if (
                 step.target == aid
-                and _overlap(step.action, need.text) >= 0.20
+                and score >= 0.20
             ):
-                matched_need = (aid, need)
-                break
+                candidates.append(
+                    (
+                        aid,
+                        need,
+                        score,
+                    )
+                )
 
-        if matched_need is None:
-            candidates = [
-                (aid, n, _overlap(step.action, n.text))
-                for aid, n in other_needs
-            ]
+        if not candidates:
 
-            if candidates:
+            all_candidates = []
+
+            for aid, need in other_needs:
+
+                if need.kind != "task":
+                    continue
+
+                need_text = " ".join(
+                    x
+                    for x in [
+                        need.action,
+                        need.object,
+                        need.location,
+                    ]
+                    if x
+                )
+
+                all_candidates.append(
+                    (
+                        aid,
+                        need,
+                        _overlap(
+                            step.action,
+                            need_text,
+                        ),
+                    )
+                )
+
+            if all_candidates:
+
                 aid, need, score = max(
-                    candidates,
+                    all_candidates,
                     key=lambda x: x[2],
                 )
 
                 if score >= 0.35:
-                    matched_need = (aid, need)
+                    candidates.append(
+                        (
+                            aid,
+                            need,
+                            score,
+                        )
+                    )
 
-        if matched_need is None and other_needs:
+        if not candidates:
             warnings.append(
                 {
                     "step": step.id,
-                    "issue": "pass_without_matching_other_need",
+                    "issue": "help_without_matching_other_need",
                     "action": step.action,
                 }
             )
 
-        evidence = list(own.can_do) + [own.capability]
+        # Capability check.
+        evidence = [
+            x.action
+            for x in own.can_do
+        ]
+
+        evidence.append(
+            own.capability
+        )
 
         best = max(
-            (_overlap(step.action, x) for x in evidence),
+            (
+                _overlap(
+                    step.action,
+                    x,
+                )
+                for x in evidence
+            ),
             default=0.0,
         )
 
@@ -228,7 +652,75 @@ def _plan_consistency_checks(
             warnings.append(
                 {
                     "step": step.id,
-                    "issue": "pass_not_supported_by_declared_capability",
+                    "issue": "help_not_supported_by_declared_capability",
+                    "action": step.action,
+                }
+            )
+
+    # ---------------------------------------------------------------
+    # check PASS
+    # ---------------------------------------------------------------
+
+    for step in plan.pass_steps():
+
+        if not step.item:
+            continue
+
+        matching_receive = False
+
+        for aid, offer in agent.others_offers.items():
+
+            for need in offer.needs:
+
+                if need.kind != "item":
+                    continue
+
+                if not need.object:
+                    continue
+
+                score = _overlap(
+                    step.item,
+                    need.object,
+                )
+
+                if (
+                    score >= 0.50
+                    and (
+                        step.target is None
+                        or step.target == aid
+                    )
+                ):
+                    matching_receive = True
+                    break
+
+            if matching_receive:
+                break
+
+        if not matching_receive:
+            warnings.append(
+                {
+                    "step": step.id,
+                    "issue": "pass_without_matching_item_need",
+                    "action": step.action,
+                }
+            )
+
+        # Check whether the item is actually in own offer.
+        own_items = [
+            p.object
+            for p in own.can_provide
+            if p.type == "item"
+            and p.object
+        ]
+
+        if not any(
+            _overlap(step.item, x) >= 0.50
+            for x in own_items
+        ):
+            warnings.append(
+                {
+                    "step": step.id,
+                    "issue": "pass_item_not_in_can_provide",
                     "action": step.action,
                 }
             )
@@ -236,97 +728,71 @@ def _plan_consistency_checks(
     return warnings
 
 
+# ---------------------------------------------------------------------------
+# direction correction
+# ---------------------------------------------------------------------------
+
 _REQUEST_VERBS = re.compile(
-    r"^(request|ask)\b",
+    r"^(request|ask|need|please)\b",
     re.IGNORECASE,
 )
 
 
-def _fix_reversed_handoffs(plan: LocalPlan) -> list[str]:
-    """A PASS step means 'I will do this for you'.
-
-    If its action instead reads as a request
-    ('Request agent_2 to move the...', 'Ask agent_3 to...'),
-    the model has the direction backwards - it is actually a NEED.
-
-    Flip it in place; `kind`/`item` stay valid since a task-need
-    needs exactly the same fields.
-    """
-    fixed = []
-
-    for s in plan.steps:
-        if (
-            s.type == "PASS"
-            and _REQUEST_VERBS.match(s.action.strip())
-        ):
-            s.type = "NEED"
-
-            if not s.action.lstrip().upper().startswith("[HELP]"):
-                s.action = "[HELP] " + s.action.strip()
-
-            # Keep the preferred target instead of deleting it.
-            # Auction treats target only as a weak hint.
-            fixed.append(s.id)
-
-    return fixed
-
-
-def _fix_passes_that_are_own_needs(
-    agent: Agent,
+def _fix_reversed_collaboration(
     plan: LocalPlan,
 ) -> list[str]:
-    """Convert a PASS into NEED when it matches the robot's own OFFER need.
 
-    Example:
-      own Offer:
-        needs = "move heavy furniture"
-
-      model output:
-        PASS "move heavy furniture" -> agent_2
-
-    This is semantically reversed. The robot needs another robot to
-    perform the task, so the step must be represented as NEED.
-    """
-    fixed = []
-
-    if agent.offer is None or not agent.offer.needs:
-        return fixed
-
-    own_needs = [
-        need
-        for need in agent.offer.needs
-        if need.kind == "task"
-    ]
+    fixed: list[str] = []
 
     for step in plan.steps:
-        if step.type != "PASS" or step.kind != "task":
-            continue
 
-        best_overlap = max(
-            (
-                _overlap(step.action, need.text)
-                for need in own_needs
-            ),
-            default=0.0,
-        )
+        action = step.action.strip()
 
-        if best_overlap >= 0.35:
-            step.type = "NEED"
+        # HELP phrased as a request:
+        #
+        # "Ask agent_2 to move the table"
+        #
+        # should actually be ASK_HELP.
+        if (
+            step.type == "HELP"
+            and _REQUEST_VERBS.match(action)
+        ):
+            step.type = "ASK_HELP"
+            step.kind = "task"
+            step.item = None
+            step.target = None
 
-            if not step.action.lstrip().upper().startswith("[HELP]"):
-                step.action = "[HELP] " + step.action.strip()
+            fixed.append(step.id)
 
-            # Keep target as a preferred helper hint.
+        # PASS phrased as receiving/request:
+        #
+        # "Ask agent_2 for the cup"
+        #
+        # should actually be RECEIVE.
+        elif (
+            step.type == "PASS"
+            and _REQUEST_VERBS.match(action)
+        ):
+            step.type = "RECEIVE"
+            step.kind = "item"
+
             fixed.append(step.id)
 
     return fixed
 
 
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
 async def make_local_plan(
     agent: Agent,
     known_agents: set[str],
 ) -> LocalPlan:
-    assert agent.offer is not None, "make_offer() must run first"
+
+    assert (
+        agent.offer is not None
+    ), "make_offer() must run first"
 
     agent.receive()
 
@@ -337,36 +803,12 @@ async def make_local_plan(
     )
 
     def parse(raw: dict) -> LocalPlan:
-        # HELP is a semantic tag over the existing NEED/task schema so this
-        # file remains compatible with the current schemas.py.
-        # The downstream Auction therefore still sees a normal task-NEED,
-        # while the plan text preserves the explicit [HELP] signal.
-        for step in raw.get("steps", []):
-            if str(step.get("type", "")).upper() == "HELP":
-                step["type"] = "NEED"
-                step["kind"] = "task"
 
-                action = str(
-                    step.get("action", "")
-                ).strip()
-
-                step["action"] = (
-                    action
-                    if action.upper().startswith("[HELP]")
-                    else "[HELP] " + action
-                )
-
-                # Do not erase a valid preferred helper target.
-                # Auction treats target as a weak hint.
-                step["target"] = step.get("target")
-
-        plan = LocalPlan.from_raw(
+        return LocalPlan.from_raw(
             agent.id,
             RawLocalPlan.model_validate(raw),
             known_agents,
         )
-
-        return plan
 
     agent.plan = await agent.ask(
         "plan",
@@ -376,60 +818,41 @@ async def make_local_plan(
         banner_label="LOCAL PLAN RAW",
     )
 
-    # ------------------------------------------------------------
-    # Fix 1:
-    # PASS written as "Request ..." / "Ask ..."
-    # ------------------------------------------------------------
-    reversed_ids = _fix_reversed_handoffs(agent.plan)
+    # ---------------------------------------------------------------
+    # direction correction
+    # ---------------------------------------------------------------
 
-    # ------------------------------------------------------------
-    # Fix 2:
-    # PASS actually corresponds to THIS robot's own unmet need
-    # ------------------------------------------------------------
-    own_need_ids = _fix_passes_that_are_own_needs(
-        agent,
-        agent.plan,
+    fixed_ids = _fix_reversed_collaboration(
+        agent.plan
     )
 
-    if reversed_ids:
+    if fixed_ids:
+
         agent.log.log(
             "plan",
             agent.id,
-            "reversed_pass_fixed",
-            steps=reversed_ids,
+            "reversed_collaboration_fixed",
+            steps=fixed_ids,
         )
 
         if agent.verbose:
             print(
                 f"  [PLAN FIX] {agent.id}: "
-                f"PASS phrased as a request, "
-                f"changed to NEED: {reversed_ids}"
+                f"reversed collaboration direction "
+                f"fixed: {fixed_ids}"
             )
 
-    if own_need_ids:
-        agent.log.log(
-            "plan",
-            agent.id,
-            "own_need_pass_fixed",
-            steps=own_need_ids,
-        )
+    # ---------------------------------------------------------------
+    # consistency checks
+    # ---------------------------------------------------------------
 
-        if agent.verbose:
-            print(
-                f"  [PLAN FIX] {agent.id}: "
-                f"PASS matched own OFFER need, "
-                f"changed to NEED: {own_need_ids}"
-            )
-
-    # ------------------------------------------------------------
-    # Consistency checks
-    # ------------------------------------------------------------
     consistency = _plan_consistency_checks(
         agent,
         agent.plan,
     )
 
     if consistency:
+
         agent.log.log(
             "plan",
             agent.id,
@@ -438,56 +861,62 @@ async def make_local_plan(
         )
 
         if agent.verbose:
+
             for w in consistency:
+
                 print(
-                    f"  [PLAN CHECK] {agent.id} "
+                    f"  [PLAN CHECK] "
+                    f"{agent.id} "
                     f"{w['issue']}: "
                     f"{w['step']} — "
                     f"{w['action']}"
                 )
 
-    # ------------------------------------------------------------
-    # Plan summary + detailed DEBUG
-    # ------------------------------------------------------------
+    # ---------------------------------------------------------------
+    # statistics
+    # ---------------------------------------------------------------
+
+    n_local = sum(
+        1
+        for s in agent.plan.steps
+        if s.type == "LOCAL"
+    )
+
+    n_ask_help = sum(
+        1
+        for s in agent.plan.steps
+        if s.type == "ASK_HELP"
+    )
+
+    n_help = sum(
+        1
+        for s in agent.plan.steps
+        if s.type == "HELP"
+    )
+
+    n_receive = sum(
+        1
+        for s in agent.plan.steps
+        if s.type == "RECEIVE"
+    )
+
     n_pass = sum(
         1
         for s in agent.plan.steps
         if s.type == "PASS"
     )
 
-    n_need = sum(
-        1
-        for s in agent.plan.steps
-        if s.type == "NEED"
-    )
-
-    n_local = (
-        len(agent.plan.steps)
-        - n_pass
-        - n_need
-    )
-
     if agent.verbose:
+
         print(
             f"  [PLAN] {agent.id}: "
             f"steps={len(agent.plan.steps)} "
             f"LOCAL={n_local} "
-            f"NEED={n_need} "
+            f"ASK_HELP={n_ask_help} "
+            f"HELP={n_help} "
+            f"RECEIVE={n_receive} "
             f"PASS={n_pass}"
         )
-
-        print(
-            f"  [PLAN DETAILS] {agent.id}"
-        )
-
-        for s in agent.plan.steps:
-            print(
-                f"    [{s.type}] "
-                f"id={s.id} "
-                f"kind={s.kind} "
-                f"target={s.target} "
-                f"| {s.action}"
-            )
 
     agent.log.log(
         "plan",
@@ -498,6 +927,10 @@ async def make_local_plan(
             agent.plan.collaboration_steps()
         ),
     )
+
+    # ---------------------------------------------------------------
+    # broadcast
+    # ---------------------------------------------------------------
 
     agent.bus.broadcast(
         agent.id,
