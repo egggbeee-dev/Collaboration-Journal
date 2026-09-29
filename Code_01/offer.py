@@ -1,27 +1,19 @@
-"""
-Stage 1 - OFFER
+"""Stage 1 - OFFER.
 
-Each robot independently examines:
-    - shared task
-    - its own capability
-    - its own private observations
-    - hidden information
-
-and generates a structured Offer.
-
-The Offer contains:
-
-    capability
-    obs_scope
-    can_do
-    cannot_do
-    can_provide
-    needs
+Each robot independently describes:
+- what it can do
+- what it cannot do
+- what it can provide
+- what it needs
 
 No robot is assigned a task at this stage.
 
-The Offer is a structured communication interface used by
-Local Planning and later Auction / Graph Reasoning stages.
+The Offer is later used by Local Planning to construct:
+    LOCAL
+    ASK_HELP
+    HELP
+    RECEIVE
+    PASS
 """
 
 from __future__ import annotations
@@ -29,12 +21,18 @@ from __future__ import annotations
 import re
 
 from runtime import Agent
-from schemas import AgentInput, Offer, RawOffer
+from schemas import (
+    AgentInput,
+    CanProvide,
+    Offer,
+    OfferNeed,
+    RawOffer,
+)
 
 
-# ===========================================================================
-# Deterministic safety check
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# physical passability check
+# ---------------------------------------------------------------------------
 
 NON_PASSABLE_KW = {
     "sink",
@@ -73,23 +71,23 @@ def _keywords(text: str) -> set[str]:
     )
 
 
-def _is_passable(item: str) -> bool:
-    """
-    A can_provide entry must refer to a physical,
-    transferable object/resource.
+def _is_passable(item: CanProvide) -> bool:
+    """Check whether a can_provide item is physically transferable."""
 
-    This is intentionally conservative.
-    """
+    if item.type != "item":
+        return True
+
+    if not item.object:
+        return False
 
     return not bool(
-        _keywords(item)
-        & NON_PASSABLE_KW
+        _keywords(item.object) & NON_PASSABLE_KW
     )
 
 
-# ===========================================================================
-# OFFER PROMPT
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# prompt
+# ---------------------------------------------------------------------------
 
 _OFFER_EXAMPLE = """
 EXAMPLE
@@ -98,10 +96,16 @@ Global task:
 "Prepare the living room for exercise."
 
 Robot capability:
-"Mobile robot with a light-duty arm.
-Can move between rooms but cannot move heavy furniture."
+"Mobile robot with a light-duty arm. Can move between rooms but cannot move heavy furniture."
 
-Possible structured Offer:
+Observed room:
+- bathtub
+- sink
+- toilet
+- bath mat
+- trash bin
+
+Valid OFFER:
 
 {
   "capability": "Mobile robot with a light-duty arm. Can move between rooms but cannot move heavy furniture.",
@@ -109,19 +113,17 @@ Possible structured Offer:
   "obs_scope": [
     {
       "object": "bath mat",
-      "location": "bathroom",
-      "state": "present"
+      "location": "bathroom"
     },
     {
       "object": "trash bin",
-      "location": "bathroom",
-      "state": "present"
+      "location": "bathroom"
     }
   ],
 
   "can_do": [
     {
-      "action": "pick_up",
+      "action": "pick up the bath mat",
       "object": "bath mat",
       "location": "bathroom"
     }
@@ -129,10 +131,9 @@ Possible structured Offer:
 
   "cannot_do": [
     {
-      "action": "move",
-      "object": "heavy furniture",
+      "action": "move heavy furniture",
       "location": "living room",
-      "reason": "insufficient physical capability"
+      "reason": "insufficient payload capacity"
     }
   ],
 
@@ -147,237 +148,164 @@ Possible structured Offer:
   "needs": [
     {
       "kind": "task",
-      "action": "move",
-      "object": "heavy furniture",
+      "action": "move heavy furniture",
       "location": "living room"
     }
   ]
 }
-
-The NEED above is valid because the robot's own capability
-prevents it from performing that required task.
 """
 
 
 OFFER_SYSTEM = f"""
 You are one robot in a team of heterogeneous robots.
 
-Each robot operates in a spatially separated environment
-and can observe only its own environment.
+Each robot works in a different room and has access only to:
+- its own images
+- its own capability
+- its own hidden information
 
-There is NO centralized task allocator at this stage.
+There is NO central task allocator at this stage.
 
-Each robot independently determines:
-
-1. what it can do,
-2. what it cannot do,
-3. what it can provide,
-4. what it needs from other robots.
-
-The purpose of the Offer is to expose local capabilities
-and concrete collaboration dependencies.
+Your job is to independently construct an OFFER describing your
+local capabilities, observations, possible contributions, and dependencies.
 
 {_OFFER_EXAMPLE}
 
+Return exactly ONE JSON object.
 
-============================================================
-INPUT
-============================================================
-
-You receive:
-
-- GLOBAL TASK
-- ROBOT CAPABILITY
-- YOUR PRIVATE IMAGES
-- HIDDEN INFORMATION
-
-Raw observations are private.
-
-Do not infer facts about another robot's environment
-unless they are explicitly contained in HIDDEN INFORMATION.
-
-
-============================================================
-OUTPUT
-============================================================
-
-Return ONLY one valid JSON object:
+JSON format:
 
 {{
   "capability": "...",
-  "obs_scope": [...],
-  "can_do": [...],
-  "cannot_do": [...],
-  "can_provide": [...],
-  "needs": [...]
+
+  "obs_scope": [
+    {{
+      "object": "...",
+      "location": "...",
+      "state": "..."
+    }}
+  ],
+
+  "can_do": [
+    {{
+      "action": "...",
+      "object": "...",
+      "location": "...",
+      "target": "..."
+    }}
+  ],
+
+  "cannot_do": [
+    {{
+      "action": "...",
+      "object": "...",
+      "location": "...",
+      "reason": "..."
+    }}
+  ],
+
+  "can_provide": [
+    {{
+      "type": "item" | "task",
+      "object": "...",
+      "location": "...",
+      "action": "..."
+    }}
+  ],
+
+  "needs": [
+    {{
+      "kind": "item" | "task",
+      "object": "...",
+      "location": "...",
+      "action": "..."
+    }}
+  ]
 }}
 
+RULES
 
-============================================================
-1. capability
-============================================================
+1. CAPABILITY
+- Copy the provided capability faithfully.
+- Never claim abilities that contradict the capability.
+- Respect mobility, payload, manipulation, and room-access constraints.
 
-Copy the provided robot capability faithfully.
+2. OBS_SCOPE
+- Include only objects or areas visible in your images or explicitly stated
+  in HIDDEN INFO.
+- Never invent unseen objects.
 
-Do not add capabilities that are not explicitly given.
+3. CAN_DO
+- List concrete actions that YOU can physically execute.
+- Ground each action in OBS_SCOPE.
+- The action must be allowed by your capability.
+- Do not include actions that require another robot.
+- Avoid vague phrases such as "help with the task".
 
+4. CANNOT_DO
+- List only task-relevant actions that your capability prevents you from doing.
+- Explain the relevant limitation briefly.
+- Do not list every imaginable inability.
 
-============================================================
-2. obs_scope
-============================================================
+5. CAN_PROVIDE
 
-List concrete objects/facts that are:
+There are two possible forms.
 
-- visible in the robot's private observations, OR
-- explicitly provided through HIDDEN INFORMATION.
+ITEM:
+- A physical object/resource that another robot could receive.
+- It must actually exist in your OBS_SCOPE or HIDDEN INFO.
+- It must be physically transferable.
 
-Each entry must have:
+TASK:
+- A task you are physically capable of performing for another robot.
+- This does NOT mean you are already assigned to perform it.
+- It only describes a capability that can later become a HELP/PASS
+  collaboration relation.
 
-{{
-  "object": "...",
-  "location": "...",
-  "state": "..."
-}}
+Never describe abstract states as transferable items.
 
-Do not invent objects or locations.
+6. NEEDS
 
+There are two possible forms.
 
-============================================================
-3. can_do
-============================================================
+ITEM:
+- A physical object you genuinely need to receive from another robot.
 
-List concrete actions this robot can perform.
+TASK:
+- A concrete task that another robot must perform because you cannot
+  perform it yourself.
 
-Each action must be represented as:
+A need must represent a genuine dependency of your own contribution.
 
-{{
-  "action": "...",
-  "object": "...",
-  "location": "...",
-  "target": "..."
-}}
+Do NOT:
+- restate the entire global task
+- request help merely because another robot is capable of something
+- assign a specific robot
+- request something you can already do yourself
 
-Rules:
+7. IMPORTANT
 
-- Must be physically supported by CAPABILITY.
-- Must be grounded in OBS_SCOPE.
-- Must directly contribute to GLOBAL TASK.
-- Do not include actions requiring another robot.
-- Do not invent objects.
-- Do not assign work to another robot.
+The OFFER does NOT decide collaboration.
 
+It only exposes:
+- capabilities
+- observations
+- possible resources
+- dependencies
 
-============================================================
-4. cannot_do
-============================================================
+The actual collaboration relations are constructed later during
+Local Planning and Auction.
 
-List task-relevant actions that this robot cannot perform
-because of physical capability or environment constraints.
-
-Format:
-
-{{
-  "action": "...",
-  "object": "...",
-  "location": "...",
-  "reason": "..."
-}}
-
-Only include meaningful task-relevant limitations.
-
-
-============================================================
-5. can_provide
-============================================================
-
-List concrete things this robot can provide to another robot.
-
-Format:
-
-For an item:
-
-{{
-  "type": "item",
-  "object": "...",
-  "location": "..."
-}}
-
-For a task contribution:
-
-{{
-  "type": "task",
-  "action": "...",
-  "object": "...",
-  "location": "..."
-}}
-
-A can_provide entry must represent something this robot
-can actually provide.
-
-Do not include abstract states such as:
-
-- clean room
-- cleared space
-- confirmation
-- completed task
-
-Do not include places as transferable items.
-
-
-============================================================
-6. needs
-============================================================
-
-List concrete dependencies required from another robot.
-
-For an item:
-
-{{
-  "kind": "item",
-  "object": "...",
-  "location": "..."
-}}
-
-For a task:
-
-{{
-  "kind": "task",
-  "action": "...",
-  "object": "...",
-  "location": "..."
-}}
-
-Rules:
-
-- A NEED must represent a real dependency.
-- Do not assign a specific robot.
-- Do not rewrite the entire GLOBAL TASK.
-- Do not list something this robot can already do itself.
-- A task-relevant NEED may overlap semantically with the GLOBAL TASK
-  when it represents a capability-induced dependency.
-
-
-============================================================
-IMPORTANT
-============================================================
-
-1. Respect CAPABILITY.
-2. Respect private observations.
-3. Never invent objects.
-4. Never assign final collaboration partners.
-5. Never generate a global plan.
-6. The Offer only describes local capability,
-   possible contributions, and dependencies.
-7. Return JSON only.
+8. OUTPUT
+Return JSON only.
 """
 
 
-# ===========================================================================
-# USER PROMPT
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# user prompt
+# ---------------------------------------------------------------------------
 
 def build_offer_user(inp: AgentInput) -> str:
-
     hidden = (
         "\n".join(
             f"- {h}"
@@ -390,18 +318,17 @@ def build_offer_user(inp: AgentInput) -> str:
         f"TASK:\n{inp.task}\n\n"
         f"CAPABILITY:\n{inp.capability}\n\n"
         f"HIDDEN INFO:\n{hidden}\n\n"
-        "The attached images show your own environment.\n"
-        "Base OBS_SCOPE, CAN_DO and CAN_PROVIDE only on "
-        "your own observations and HIDDEN INFO, filtered through "
-        "your CAPABILITY.\n\n"
-        "Determine concrete NEEDS required to accomplish the "
-        "GLOBAL TASK that your robot cannot satisfy itself."
+        "The attached images show your own room.\n"
+        "Base OBS_SCOPE, CAN_DO, and CAN_PROVIDE only on "
+        "your own observations and HIDDEN INFO.\n"
+        "For NEEDS, reason about genuine dependencies of "
+        "your own contribution."
     )
 
 
-# ===========================================================================
-# OFFER GENERATION
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
 
 async def make_offer(agent: Agent) -> Offer:
 
@@ -413,60 +340,49 @@ async def make_offer(agent: Agent) -> Offer:
         banner_label="OFFER RAW",
     )
 
-    # --------------------------------------------------------
-    # Deterministic can_provide safety filter
-    # --------------------------------------------------------
+    # ---------------------------------------------------------------
+    # deterministic filtering of non-transferable items
+    # ---------------------------------------------------------------
 
-    kept_provide = []
-    dropped_provide = []
+    kept_provide = [
+        p
+        for p in raw.can_provide
+        if _is_passable(p)
+    ]
 
-    for provide in raw.can_provide:
-
-        # Only item entries are checked for physical passability.
-        if provide.type == "item":
-
-            text = " ".join(
-                x
-                for x in [
-                    provide.object,
-                    provide.location,
-                ]
-                if x
-            )
-
-            if not _is_passable(text):
-                dropped_provide.append(
-                    provide.model_dump()
-                )
-                continue
-
-        kept_provide.append(provide)
+    dropped_provide = [
+        p
+        for p in raw.can_provide
+        if not _is_passable(p)
+    ]
 
     if dropped_provide:
-
         agent.log.log(
             "offer",
             agent.id,
             "can_provide_filtered",
-            dropped=dropped_provide,
+            dropped=[
+                p.model_dump()
+                for p in dropped_provide
+            ],
         )
 
         if agent.verbose:
             print(
                 f"  [OFFER FILTER] {agent.id}: "
-                f"non-passable can_provide dropped: "
-                f"{dropped_provide}"
+                f"non-passable items dropped: "
+                f"{[p.model_dump() for p in dropped_provide]}"
             )
 
     raw = raw.model_copy(
         update={
-            "can_provide": kept_provide
+            "can_provide": kept_provide,
         }
     )
 
-    # --------------------------------------------------------
-    # Create broadcast Offer
-    # --------------------------------------------------------
+    # ---------------------------------------------------------------
+    # attach agent ID
+    # ---------------------------------------------------------------
 
     agent.offer = Offer(
         agent=agent.id,
@@ -474,7 +390,6 @@ async def make_offer(agent: Agent) -> Offer:
     )
 
     if agent.verbose:
-
         print(
             f"  [OFFER] {agent.id}: "
             f"obs_scope={len(agent.offer.obs_scope)} "
@@ -482,20 +397,6 @@ async def make_offer(agent: Agent) -> Offer:
             f"cannot_do={len(agent.offer.cannot_do)} "
             f"can_provide={len(agent.offer.can_provide)} "
             f"needs={len(agent.offer.needs)}"
-        )
-
-        print(
-            f"  [OFFER DETAILS] {agent.id}"
-        )
-
-        print(
-            f"    can_do: "
-            f"{[x.model_dump() for x in agent.offer.can_do]}"
-        )
-
-        print(
-            f"    needs: "
-            f"{[x.model_dump() for x in agent.offer.needs]}"
         )
 
     agent.log.log(
