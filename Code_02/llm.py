@@ -1,4 +1,3 @@
-```python
 """LLM clients. The pipeline only depends on `complete_json`, so the real GPT-4o client
 and the scripted mock client are interchangeable.
 
