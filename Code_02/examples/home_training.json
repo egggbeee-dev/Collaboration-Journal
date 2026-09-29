@@ -1,0 +1,25 @@
+{
+  "task": "Prepare the living room for exercise: clear a floor spot, lay a mat on it, and put a water bottle next to the mat.",
+  "agents": [
+    {
+      "capability": "Fixed-base robot arm mounted in the kitchen. Cannot leave the kitchen. Can pick up and hand over items within reach.",
+      "images": [],
+      "hidden_info": ["A water bottle is on the high kitchen shelf; only this arm can reach it."]
+    },
+    {
+      "capability": "Heavy-duty mobile robot in the living room. Can move heavy furniture.",
+      "images": [],
+      "hidden_info": []
+    },
+    {
+      "capability": "Light-duty mobile robot in the bedroom. Can move between rooms and carry light objects. Cannot move heavy furniture.",
+      "images": [],
+      "hidden_info": ["A heavy sofa blocks the only free floor spot in the living room."]
+    },
+    {
+      "capability": "Light-duty mobile robot in the bathroom. Can move between rooms and carry light objects. Cannot move heavy furniture.",
+      "images": [],
+      "hidden_info": []
+    }
+  ]
+}
