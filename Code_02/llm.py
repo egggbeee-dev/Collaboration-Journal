@@ -82,11 +82,15 @@ class OpenAIClient(BaseLLM):
                     raise
                 await asyncio.sleep(2**attempt)  # backoff outside the semaphore
 
-        usage = resp.usage
-        self._record(tag, usage.prompt_tokens if usage else 0, usage.completion_tokens if usage else 0)
-        return json.loads(resp.choices[0].message.content)  # JSONDecodeError is a ValueError -> retried upstream
-
-
+         usage = resp.usage
+         self._record(tag, usage.prompt_tokens if usage else 0, usage.completion_tokens if usage else 0)
+        choice = resp.choices[0]
+        content = choice.message.content
+        if not content:
+            # refusal / content filter / truncated output: raise a ValueError so the caller can retry
+            reason = getattr(choice.message, "refusal", None) or f"finish_reason={choice.finish_reason}"
+            raise ValueError(f"[{tag}] empty LLM response ({reason})")
+        return json.loads(content)  # JSONDecodeError is a ValueError -> retried upstream
 # --------------------------------------------------------------------------- mock client
 class ScriptedClient(BaseLLM):
     """Returns canned JSON by tag. A value may be a list: answers are then consumed in
