@@ -4,7 +4,7 @@ Stage 1 - OFFER
     Each robot independently describes:
     - what it can do
     - what it cannot do
-    - what it can provide
+    - what it can providef
     - what it needs
 
 Stage 2 - LOCAL PLANNING
@@ -195,49 +195,68 @@ class CanProvide(BaseModel):
 class OfferNeed(BaseModel):
     """A genuine dependency declared in an Offer.
 
-    kind="task"
+    `kind="task"`:
         The robot needs another robot to perform a task.
 
-    kind="item"
+    `kind="item"`:
         The robot needs another robot to provide an item.
+
+    `text` is kept for backward compatibility with Auction / logging code.
     """
 
     kind: Kind
 
+    # Backward-compatible canonical text representation.
+    text: Optional[str] = None
+
+    # Structured fields used by the new Offer format.
     object: Optional[str] = None
-
     location: Optional[str] = None
-
     action: Optional[str] = None
 
     @model_validator(mode="after")
-    def _validate_need(self):
+    def _normalize(self):
         # ---------------------------------------------------------------
-        # TASK
+        # If the new format provides action, use it as the canonical text.
+        # ---------------------------------------------------------------
+        if not self.text:
+            if self.action:
+                self.text = self.action
+            elif self.object:
+                self.text = self.object
+
+        # ---------------------------------------------------------------
+        # If the old format provides text only, keep it usable by the
+        # new structured representation as an action.
+        # ---------------------------------------------------------------
+        if not self.action and self.text:
+            self.action = self.text
+
+        # ---------------------------------------------------------------
+        # Required semantic content
+        # ---------------------------------------------------------------
+        if not self.text:
+            raise ValueError(
+                f"OfferNeed(kind={self.kind!r}) requires "
+                f"'text', 'action', or 'object'."
+            )
+
+        # ---------------------------------------------------------------
+        # Task need
         # ---------------------------------------------------------------
         if self.kind == "task":
-            if not self.action:
-                raise ValueError(
-                    "OfferNeed(kind='task') requires 'action'."
-                )
-
             self.object = None
 
-            return self
-
         # ---------------------------------------------------------------
-        # ITEM
+        # Item need
         # ---------------------------------------------------------------
-        if self.kind == "item":
+        elif self.kind == "item":
             if not self.object:
-                raise ValueError(
-                    "OfferNeed(kind='item') requires 'object'."
-                )
-
-            return self
+                # For backward compatibility, allow the text itself
+                # to serve as the item description.
+                self.object = self.text
 
         return self
-
 
 class RawOffer(BaseModel):
     """What the Offer-generation LLM writes."""
