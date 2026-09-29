@@ -1,24 +1,55 @@
-"""Stage 4 - GRAPH REASONING (layered verification + minimal-intervention repair).
-
-Graph
-  node = one step of one robot        (id, agent, order, type, kind, action, item, active)
-  edge = "sequence" (intra-agent execution dependency)
-         "collaboration" (inter-agent dependency; confirmed or candidate)
-  A PASS step that lost the Auction is inactive (its owner withdrew it) but is remembered
-  as a self-nominated candidate, so it can be re-instated by a `reassign`.
-
-Layer 1 - RuleVerifier (deterministic, no LLM)
-  orphan PASS removal, cycle breaking, unresolved NEED report, use-before-receive warning,
-  topological order + levels.
-Layer 2 - LLMReasoner (one central LLM call, text only, never sees images / hidden info)
-  Looks for semantic errors and repairs them DIRECTLY, but only through 3 guarded operations:
-    reassign : move a NEED to another *self-nominated* candidate (no new collaboration)
-    unmatch  : cut a wrong collaboration dependency
-    add_order: add a cross-robot ordering constraint between two existing steps
-  It cannot create, delete or rewrite steps. Every operation is validated and reverted if it
-  would create a cycle.
-Layer 1 runs again after the LLM (guard).
 """
+Stage 4 - GRAPH REASONING
+
+Centralized global coordination over independently generated local plans.
+
+Input:
+    - Local Plans
+    - Auction provisional matches
+    - ALL Auction candidate edges
+
+Step-type semantics:
+    LOCAL
+        Execute an action locally.
+
+    ASK_HELP
+        Request another robot to perform a task.
+
+    HELP
+        Volunteer to perform a task requested by another robot.
+
+    RECEIVE
+        Request / receive a physical item from another robot.
+
+    PASS
+        Provide / pass a physical item to another robot.
+
+Matching channels:
+    ASK_HELP <-> HELP
+    RECEIVE  <-> PASS
+
+The Auction only generates candidate coordination edges.
+Graph Reasoning determines the final dependency structure.
+
+Allowed LLM operations:
+    reassign
+        Replace the current provider of a request with another
+        Auction-generated candidate.
+
+    unmatch
+        Remove an incorrect collaboration relation.
+
+    add_order
+        Add a cross-robot ordering dependency.
+
+The LLM cannot:
+    - create new steps
+    - delete steps
+    - rewrite actions
+    - create collaboration with a robot that was never a candidate
+    - access private observations/images
+"""
+
 from __future__ import annotations
 
 import copy
@@ -32,10 +63,13 @@ from pydantic import BaseModel, Field, model_validator
 from auction import AuctionResult
 from llm import BaseLLM
 from runtime import EventLog, call_validated
-from schemas import LocalPlan, agent_of
+from schemas import LocalPlan, Step, agent_of
 
 
-# =========================================================================== graph
+# ============================================================================
+# Graph
+# ============================================================================
+
 @dataclass
 class Node:
     id: str
@@ -52,361 +86,1620 @@ class Node:
 class Edge:
     src: str
     dst: str
-    kind: str  # sequence | collaboration
-    status: str = "confirmed"  # confirmed | candidate
+    kind: str
+    status: str = "confirmed"
+    # kind:
+    #   sequence
+    #   collaboration
+    #
+    # status:
+    #   confirmed
+    #   candidate
 
 
 class PlanGraph:
-    def __init__(self, task: str, plans: dict[str, LocalPlan], auction: AuctionResult) -> None:
+
+    def __init__(
+        self,
+        task: str,
+        plans: dict[str, LocalPlan],
+        auction: AuctionResult,
+    ) -> None:
+
         self.task = task
+
+        # ------------------------------------------------------------
+        # Nodes
+        # ------------------------------------------------------------
+
         self.nodes: dict[str, Node] = {}
+
         for aid, plan in plans.items():
-            for s in plan.steps:
-                self.nodes[s.id] = Node(s.id, aid, s.order, s.type, s.kind, s.action, s.item)
-        self.handoff: dict[str, str] = {m.need: m.passed for m in auction.matches}          # need -> pass
-        self.handoff_score: dict[str, float] = {m.need: m.score for m in auction.matches}
+            for step in plan.steps:
+                self.nodes[step.id] = Node(
+                    id=step.id,
+                    agent=aid,
+                    order=step.order,
+                    type=step.type,
+                    kind=step.kind,
+                    action=step.action,
+                    item=step.item,
+                    active=True,
+                )
+
+        # ------------------------------------------------------------
+        # Auction provisional matches
+        #
+        # need -> provider
+        #
+        # provider can be HELP or PASS
+        # request can be ASK_HELP or RECEIVE
+        # ------------------------------------------------------------
+
+        self.handoff: dict[str, str] = {
+            match.need: match.passed
+            for match in auction.matches
+        }
+
+        self.handoff_score: dict[str, float] = {
+            match.need: match.score
+            for match in auction.matches
+        }
+
+        # Additional cross-robot ordering constraints.
         self.extra_collaboration: list[tuple[str, str]] = []
+
+        # ALL candidate edges generated by Auction.
         self.candidates: dict[str, list[dict]] = auction.candidates
-        matched = set(self.handoff.values())
-        for n in self.nodes.values():
-            if n.type == "PASS" and n.id not in matched:
-                n.active = False  # withdrawn by its owner after losing the Auction
 
-    # -- views
+        # ------------------------------------------------------------
+        # Provider activation
+        #
+        # A HELP/PASS step that was not selected by the provisional
+        # Auction is initially inactive.
+        #
+        # However, it remains in the graph and can be reactivated
+        # later by Graph Reasoning through `reassign`.
+        # ------------------------------------------------------------
+
+        matched_providers = set(self.handoff.values())
+
+        for node in self.nodes.values():
+
+            if node.type in {"HELP", "PASS"}:
+                node.active = node.id in matched_providers
+
+    # ----------------------------------------------------------------
+    # Views
+    # ----------------------------------------------------------------
+
     def active_ids(self) -> list[str]:
-        return [i for i, n in self.nodes.items() if n.active]
+        return [
+            node_id
+            for node_id, node in self.nodes.items()
+            if node.active
+        ]
 
-    def sort_key(self, nid: str):
-        n = self.nodes[nid]
-        return (int(n.agent.split("_")[-1]), n.order)
+    def sort_key(self, node_id: str):
+        node = self.nodes[node_id]
+
+        try:
+            agent_num = int(node.agent.split("_")[-1])
+        except ValueError:
+            agent_num = 0
+
+        return (
+            agent_num,
+            node.order,
+        )
 
     def agent_sequence(self, agent: str) -> list[Node]:
-        return sorted((n for n in self.nodes.values() if n.agent == agent and n.active), key=lambda n: n.order)
 
-    def edges(self, include_candidates: bool = False) -> list[Edge]:
+        return sorted(
+            (
+                node
+                for node in self.nodes.values()
+                if node.agent == agent and node.active
+            ),
+            key=lambda node: node.order,
+        )
+
+    # ----------------------------------------------------------------
+    # Edges
+    # ----------------------------------------------------------------
+
+    def edges(
+        self,
+        include_candidates: bool = False,
+    ) -> list[Edge]:
+
         out: list[Edge] = []
-        for agent in sorted({n.agent for n in self.nodes.values()}):
-            seq = self.agent_sequence(agent)
-            out += [Edge(a.id, b.id, "sequence") for a, b in zip(seq, seq[1:])]
-        for need, p in sorted(self.handoff.items()):
-            if self.nodes[need].active and self.nodes[p].active:
-                out.append(Edge(p, need, "collaboration", "confirmed"))
-        for a, b in self.extra_collaboration:
-            if self.nodes[a].active and self.nodes[b].active:
-                out.append(Edge(a, b, "collaboration", "confirmed"))
-        # Unresolved Auction candidates remain in the graph as candidate collaboration edges.
-        # They are visible to the reasoner but do not constrain execution until confirmed.
-        confirmed_pairs = set((p, n) for n, p in self.handoff.items())
-        for need, lst in self.candidates.items():
-            if need not in self.nodes or not self.nodes[need].active:
+
+        # ------------------------------------------------------------
+        # 1. Intra-robot sequence dependencies
+        # ------------------------------------------------------------
+
+        agents = sorted(
+            {node.agent for node in self.nodes.values()}
+        )
+
+        for agent in agents:
+
+            sequence = self.agent_sequence(agent)
+
+            for a, b in zip(sequence, sequence[1:]):
+
+                out.append(
+                    Edge(
+                        src=a.id,
+                        dst=b.id,
+                        kind="sequence",
+                        status="confirmed",
+                    )
+                )
+
+        # ------------------------------------------------------------
+        # 2. Confirmed collaboration dependencies
+        #
+        # provider -> requester
+        #
+        # Example:
+        #
+        # R2 HELP
+        #      |
+        #      v
+        # R3 ASK_HELP
+        # ------------------------------------------------------------
+
+        for request_id, provider_id in sorted(
+            self.handoff.items()
+        ):
+
+            if request_id not in self.nodes:
                 continue
-            for c in lst:
-                p = c["pass"]
-                if (p, need) in confirmed_pairs or p not in self.nodes:
+
+            if provider_id not in self.nodes:
+                continue
+
+            request_node = self.nodes[request_id]
+            provider_node = self.nodes[provider_id]
+
+            if not request_node.active:
+                continue
+
+            if not provider_node.active:
+                continue
+
+            out.append(
+                Edge(
+                    src=provider_id,
+                    dst=request_id,
+                    kind="collaboration",
+                    status="confirmed",
+                )
+            )
+
+        # ------------------------------------------------------------
+        # 3. Additional cross-robot ordering constraints
+        # ------------------------------------------------------------
+
+        for src, dst in self.extra_collaboration:
+
+            if src not in self.nodes or dst not in self.nodes:
+                continue
+
+            if not self.nodes[src].active:
+                continue
+
+            if not self.nodes[dst].active:
+                continue
+
+            out.append(
+                Edge(
+                    src=src,
+                    dst=dst,
+                    kind="collaboration",
+                    status="confirmed",
+                )
+            )
+
+        # ------------------------------------------------------------
+        # 4. Unresolved Auction candidate edges
+        #
+        # They are visible to the LLM reasoner but do not affect
+        # topological ordering until confirmed.
+        # ------------------------------------------------------------
+
+        if include_candidates:
+
+            confirmed_pairs = {
+                (provider_id, request_id)
+                for request_id, provider_id
+                in self.handoff.items()
+            }
+
+            for request_id, candidate_list in self.candidates.items():
+
+                if request_id not in self.nodes:
                     continue
-                out.append(Edge(p, need, "collaboration", "candidate"))
+
+                if not self.nodes[request_id].active:
+                    continue
+
+                for candidate in candidate_list:
+
+                    provider_id = candidate["pass"]
+
+                    if provider_id not in self.nodes:
+                        continue
+
+                    if (
+                        provider_id,
+                        request_id,
+                    ) in confirmed_pairs:
+                        continue
+
+                    out.append(
+                        Edge(
+                            src=provider_id,
+                            dst=request_id,
+                            kind="collaboration",
+                            status="candidate",
+                        )
+                    )
+
         if not include_candidates:
-            out = [e for e in out if e.status == "confirmed"]
+
+            out = [
+                edge
+                for edge in out
+                if edge.status == "confirmed"
+            ]
+
         return out
 
-    def snapshot(self):
-        return copy.deepcopy(({i: n.active for i, n in self.nodes.items()}, self.handoff, self.handoff_score, self.extra_collaboration))
+    # ----------------------------------------------------------------
+    # Snapshot / restore
+    # ----------------------------------------------------------------
 
-    def restore(self, snap) -> None:
-        active, self.handoff, self.handoff_score, self.extra_collaboration = copy.deepcopy(snap)
-        for i, a in active.items():
-            self.nodes[i].active = a
+    def snapshot(self):
+
+        return copy.deepcopy(
+            (
+                {
+                    node_id: node.active
+                    for node_id, node in self.nodes.items()
+                },
+                self.handoff,
+                self.handoff_score,
+                self.extra_collaboration,
+            )
+        )
+
+    def restore(self, snapshot) -> None:
+
+        (
+            active,
+            self.handoff,
+            self.handoff_score,
+            self.extra_collaboration,
+        ) = copy.deepcopy(snapshot)
+
+        for node_id, is_active in active.items():
+            self.nodes[node_id].active = is_active
+
+    # ----------------------------------------------------------------
+    # Serialization
+    # ----------------------------------------------------------------
 
     def to_dict(self) -> dict:
+
         return {
-            "nodes": [n.__dict__ for n in sorted(self.nodes.values(), key=lambda n: self.sort_key(n.id))],
-            "handoffs": [{"need": n, "pass": p, "score": self.handoff_score.get(n)} for n, p in sorted(self.handoff.items())],
-            "extra_collaboration": [list(t) for t in self.extra_collaboration],
-            "edges": [e.__dict__ for e in self.edges(include_candidates=True)],
+            "nodes": [
+                node.__dict__
+                for node in sorted(
+                    self.nodes.values(),
+                    key=lambda node: self.sort_key(node.id),
+                )
+            ],
+
+            "handoffs": [
+                {
+                    "need": request_id,
+                    "pass": provider_id,
+                    "score": self.handoff_score.get(request_id),
+                }
+                for request_id, provider_id
+                in sorted(self.handoff.items())
+            ],
+
+            "extra_collaboration": [
+                list(pair)
+                for pair in self.extra_collaboration
+            ],
+
+            "edges": [
+                edge.__dict__
+                for edge in self.edges(
+                    include_candidates=True
+                )
+            ],
         }
 
 
-# =========================================================================== graph algorithms
-def find_cycle(graph: PlanGraph) -> list[Edge] | None:
-    adj: dict[str, list[Edge]] = defaultdict(list)
-    for e in graph.edges(include_candidates=False):
-        adj[e.src].append(e)
-    color = {n: 0 for n in graph.active_ids()}
+# ============================================================================
+# Graph algorithms
+# ============================================================================
+
+def find_cycle(
+    graph: PlanGraph,
+) -> list[Edge] | None:
+
+    adjacency: dict[str, list[Edge]] = defaultdict(list)
+
+    for edge in graph.edges(
+        include_candidates=False
+    ):
+        adjacency[edge.src].append(edge)
+
+    color = {
+        node_id: 0
+        for node_id in graph.active_ids()
+    }
+
     parent: dict[str, Edge] = {}
 
-    def dfs(u: str):
-        color[u] = 1
-        for e in adj[u]:
-            v = e.dst
-            if color[v] == 0:
-                parent[v] = e
-                r = dfs(v)
-                if r:
-                    return r
-            elif color[v] == 1:  # back edge -> cycle v ... u -> v
-                cyc, x = [e], u
-                while x != v:
-                    pe = parent[x]
-                    cyc.append(pe)
-                    x = pe.src
-                return cyc
-        color[u] = 2
+    def dfs(node_id: str):
+
+        color[node_id] = 1
+
+        for edge in adjacency[node_id]:
+
+            next_id = edge.dst
+
+            if color[next_id] == 0:
+
+                parent[next_id] = edge
+
+                result = dfs(next_id)
+
+                if result:
+                    return result
+
+            elif color[next_id] == 1:
+
+                cycle = [edge]
+                current = node_id
+
+                while current != next_id:
+
+                    parent_edge = parent[current]
+                    cycle.append(parent_edge)
+
+                    current = parent_edge.src
+
+                return cycle
+
+        color[node_id] = 2
+
         return None
 
-    for n in sorted(color, key=graph.sort_key):
-        if color[n] == 0:
-            r = dfs(n)
-            if r:
-                return r
+    for node_id in sorted(
+        color,
+        key=graph.sort_key,
+    ):
+
+        if color[node_id] == 0:
+
+            result = dfs(node_id)
+
+            if result:
+                return result
+
     return None
 
 
 def topological_levels(graph: PlanGraph):
-    """Kahn's algorithm with deterministic tie-breaks. Returns (order, level) or None if cyclic."""
-    ids = graph.active_ids()
-    indeg = {i: 0 for i in ids}
-    succ: dict[str, list[str]] = defaultdict(list)
-    for e in graph.edges(include_candidates=False):
-        succ[e.src].append(e.dst)
-        indeg[e.dst] += 1
-    level = {i: 0 for i in ids}
-    ready = sorted([i for i in ids if indeg[i] == 0], key=graph.sort_key)
+
+    """
+    Kahn's algorithm.
+
+    Returns:
+        (topological_order, level)
+
+    or:
+        None if the graph contains a cycle.
+    """
+
+    node_ids = graph.active_ids()
+
+    indegree = {
+        node_id: 0
+        for node_id in node_ids
+    }
+
+    successors: dict[str, list[str]] = defaultdict(list)
+
+    for edge in graph.edges(
+        include_candidates=False
+    ):
+
+        successors[edge.src].append(edge.dst)
+        indegree[edge.dst] += 1
+
+    level = {
+        node_id: 0
+        for node_id in node_ids
+    }
+
+    ready = sorted(
+        [
+            node_id
+            for node_id in node_ids
+            if indegree[node_id] == 0
+        ],
+        key=graph.sort_key,
+    )
+
     order: list[str] = []
+
     while ready:
-        u = ready.pop(0)
-        order.append(u)
-        for v in succ[u]:
-            level[v] = max(level[v], level[u] + 1)
-            indeg[v] -= 1
-            if indeg[v] == 0:
-                ready.append(v)
-                ready.sort(key=graph.sort_key)
-    return (order, level) if len(order) == len(ids) else None
+
+        current = ready.pop(0)
+
+        order.append(current)
+
+        for next_id in successors[current]:
+
+            level[next_id] = max(
+                level[next_id],
+                level[current] + 1,
+            )
+
+            indegree[next_id] -= 1
+
+            if indegree[next_id] == 0:
+
+                ready.append(next_id)
+
+                ready.sort(
+                    key=graph.sort_key
+                )
+
+    if len(order) != len(node_ids):
+        return None
+
+    return order, level
 
 
-def reachable(graph: PlanGraph, a: str, b: str) -> bool:
-    adj: dict[str, list[str]] = defaultdict(list)
-    for e in graph.edges(include_candidates=False):
-        adj[e.src].append(e.dst)
-    seen, stack = {a}, [a]
+def reachable(
+    graph: PlanGraph,
+    source: str,
+    target: str,
+) -> bool:
+
+    adjacency: dict[str, list[str]] = defaultdict(list)
+
+    for edge in graph.edges(
+        include_candidates=False
+    ):
+        adjacency[edge.src].append(edge.dst)
+
+    visited = {source}
+    stack = [source]
+
     while stack:
-        u = stack.pop()
-        if u == b:
+
+        current = stack.pop()
+
+        if current == target:
             return True
-        for v in adj[u]:
-            if v not in seen:
-                seen.add(v)
-                stack.append(v)
+
+        for next_id in adjacency[current]:
+
+            if next_id not in visited:
+
+                visited.add(next_id)
+                stack.append(next_id)
+
     return False
 
 
-# =========================================================================== layer 1: rules
+# ============================================================================
+# Layer 1 - Rule verification
+# ============================================================================
+
 @dataclass
 class RuleReport:
-    fixes: list[dict] = field(default_factory=list)
-    warnings: list[str] = field(default_factory=list)
-    unresolved_needs: list[str] = field(default_factory=list)
-    order: list[str] = field(default_factory=list)
-    levels: dict[str, int] = field(default_factory=dict)
+
+    fixes: list[dict] = field(
+        default_factory=list
+    )
+
+    warnings: list[str] = field(
+        default_factory=list
+    )
+
+    unresolved_needs: list[str] = field(
+        default_factory=list
+    )
+
+    order: list[str] = field(
+        default_factory=list
+    )
+
+    levels: dict[str, int] = field(
+        default_factory=dict
+    )
+
     ok: bool = True
 
     def to_dict(self) -> dict:
         return self.__dict__.copy()
 
 
-def rule_verify(graph: PlanGraph) -> RuleReport:
-    rep = RuleReport()
+def rule_verify(
+    graph: PlanGraph,
+) -> RuleReport:
 
-    # 1. orphan PASS (nobody receives it) -> its owner withdraws it
-    matched = {p for n, p in graph.handoff.items() if graph.nodes[n].active}
-    for n in graph.nodes.values():
-        if n.active and n.type == "PASS" and n.id not in matched:
-            n.active = False
-            rep.fixes.append({"rule": "orphan_pass_withdrawn", "step": n.id})
+    report = RuleReport()
 
-    # 2. cycles -> cut the weakest handoff inside the cycle (never invent steps)
-    while (cyc := find_cycle(graph)) is not None:
-        hand = [e for e in cyc if e.kind == "collaboration" and e.status == "confirmed"]
-        if hand:
-            e = min(hand, key=lambda e: graph.handoff_score.get(e.dst, 0.0))
-            del graph.handoff[e.dst]
-            graph.handoff_score.pop(e.dst, None)
-            graph.nodes[e.src].active = False
-            rep.fixes.append({"rule": "cycle_broken", "removed_handoff": [e.src, e.dst]})
+    # ----------------------------------------------------------------
+    # 1. Orphan providers
+    #
+    # HELP / PASS that are not used by any confirmed collaboration
+    # are inactive.
+    #
+    # They are NOT deleted because they may still be reintroduced
+    # by Graph Reasoning if they are valid candidates.
+    # ----------------------------------------------------------------
+
+    matched_providers = {
+        provider_id
+        for request_id, provider_id
+        in graph.handoff.items()
+        if (
+            request_id in graph.nodes
+            and graph.nodes[request_id].active
+        )
+    }
+
+    for node in graph.nodes.values():
+
+        if node.type not in {"HELP", "PASS"}:
             continue
-        extra = [e for e in cyc if e.kind == "collaboration" and e.status == "confirmed" and (e.src, e.dst) in graph.extra_collaboration]
-        if extra:
-            graph.extra_collaboration.remove((extra[-1].src, extra[-1].dst))
-            rep.fixes.append({"rule": "cycle_broken", "removed_order": [extra[-1].src, extra[-1].dst]})
+
+        if node.id in matched_providers:
+            node.active = True
             continue
-        rep.ok = False
-        rep.warnings.append("unbreakable cycle inside a single robot's own sequence")
-        return rep
 
-    # 3. NEED without a provider -> report (we never fabricate a provider)
-    rep.unresolved_needs = [n.id for n in graph.nodes.values() if n.active and n.type == "NEED" and n.id not in graph.handoff]
+        if node.active:
 
-    # 4. an item is used before the step that receives it (same robot)
-    for r in graph.nodes.values():
-        if not (r.active and r.type == "NEED" and r.kind == "item" and r.item):
+            node.active = False
+
+            report.fixes.append(
+                {
+                    "rule": "orphan_provider_withdrawn",
+                    "step": node.id,
+                    "type": node.type,
+                }
+            )
+
+    # ----------------------------------------------------------------
+    # 2. Cycle detection / breaking
+    # ----------------------------------------------------------------
+
+    while True:
+
+        cycle = find_cycle(graph)
+
+        if cycle is None:
+            break
+
+        collaboration_edges = [
+            edge
+            for edge in cycle
+            if (
+                edge.kind == "collaboration"
+                and edge.status == "confirmed"
+            )
+        ]
+
+        # ------------------------------------------------------------
+        # Prefer removing the weakest confirmed handoff.
+        # ------------------------------------------------------------
+
+        handoff_edges = [
+            edge
+            for edge in collaboration_edges
+            if edge.dst in graph.handoff
+            and graph.handoff.get(edge.dst) == edge.src
+        ]
+
+        if handoff_edges:
+
+            weakest = min(
+                handoff_edges,
+                key=lambda edge:
+                    graph.handoff_score.get(
+                        edge.dst,
+                        0.0,
+                    ),
+            )
+
+            request_id = weakest.dst
+            provider_id = weakest.src
+
+            del graph.handoff[request_id]
+
+            graph.handoff_score.pop(
+                request_id,
+                None,
+            )
+
+            if provider_id in graph.nodes:
+                graph.nodes[provider_id].active = False
+
+            report.fixes.append(
+                {
+                    "rule": "cycle_broken",
+                    "removed_handoff": [
+                        provider_id,
+                        request_id,
+                    ],
+                }
+            )
+
             continue
-        for u in graph.agent_sequence(r.agent):
-            if u.type == "LOCAL" and u.order < r.order and r.item.lower() in u.action.lower():
-                rep.warnings.append(f"{u.id} seems to use '{r.item}' before it is received at {r.id}")
 
-    # 5. schedule
-    res = topological_levels(graph)
-    if res is None:
-        rep.ok = False
+        # ------------------------------------------------------------
+        # Additional cross-robot ordering edge
+        # ------------------------------------------------------------
+
+        extra_edges = [
+            edge
+            for edge in collaboration_edges
+            if (
+                edge.src,
+                edge.dst,
+            ) in graph.extra_collaboration
+        ]
+
+        if extra_edges:
+
+            edge = extra_edges[-1]
+
+            graph.extra_collaboration.remove(
+                (edge.src, edge.dst)
+            )
+
+            report.fixes.append(
+                {
+                    "rule": "cycle_broken",
+                    "removed_order": [
+                        edge.src,
+                        edge.dst,
+                    ],
+                }
+            )
+
+            continue
+
+        # ------------------------------------------------------------
+        # If the cycle only exists inside one robot's sequence,
+        # we cannot repair it here.
+        # ------------------------------------------------------------
+
+        report.ok = False
+
+        report.warnings.append(
+            "unbreakable cycle inside a single robot's own sequence"
+        )
+
+        return report
+
+    # ----------------------------------------------------------------
+    # 3. Unresolved collaboration requests
+    #
+    # ASK_HELP / RECEIVE without a confirmed provider.
+    # ----------------------------------------------------------------
+
+    report.unresolved_needs = [
+        node.id
+        for node in graph.nodes.values()
+        if (
+            node.active
+            and node.type in {"ASK_HELP", "RECEIVE"}
+            and node.id not in graph.handoff
+        )
+    ]
+
+    # ----------------------------------------------------------------
+    # 4. Item use-before-receive check
+    # ----------------------------------------------------------------
+
+    for request in graph.nodes.values():
+
+        if not (
+            request.active
+            and request.type == "RECEIVE"
+            and request.kind == "item"
+            and request.item
+        ):
+            continue
+
+        for node in graph.agent_sequence(
+            request.agent
+        ):
+
+            if (
+                node.type == "LOCAL"
+                and node.order < request.order
+                and request.item.lower()
+                in node.action.lower()
+            ):
+
+                report.warnings.append(
+                    f"{node.id} seems to use "
+                    f"'{request.item}' before it is "
+                    f"received at {request.id}"
+                )
+
+    # ----------------------------------------------------------------
+    # 5. Topological schedule
+    # ----------------------------------------------------------------
+
+    result = topological_levels(graph)
+
+    if result is None:
+
+        report.ok = False
+
     else:
-        rep.order, rep.levels = res
-    return rep
+
+        report.order, report.levels = result
+
+    return report
 
 
-# =========================================================================== layer 2: LLM reasoner
+# ============================================================================
+# Layer 2 - LLM Graph Reasoner
+# ============================================================================
+
 class GraphOp(BaseModel):
-    op: Literal["reassign", "unmatch", "add_order"]
+
+    op: Literal[
+        "reassign",
+        "unmatch",
+        "add_order",
+    ]
+
+    # ------------------------------------------------------------
+    # Reassign / unmatch
+    # ------------------------------------------------------------
+
     need: Optional[str] = None
+
     to_pass: Optional[str] = None
+
+    # ------------------------------------------------------------
+    # Cross-robot ordering
+    # ------------------------------------------------------------
+
     before: Optional[str] = None
     after: Optional[str] = None
+
     reason: str = ""
 
     @model_validator(mode="after")
-    def _fields(self):
-        need_fields = {"reassign": ("need", "to_pass"), "unmatch": ("need",), "add_order": ("before", "after")}[self.op]
-        for f in need_fields:
-            if not getattr(self, f):
-                raise ValueError(f"op '{self.op}' needs field '{f}'")
+    def validate_fields(self):
+
+        required_fields = {
+            "reassign": (
+                "need",
+                "to_pass",
+            ),
+
+            "unmatch": (
+                "need",
+            ),
+
+            "add_order": (
+                "before",
+                "after",
+            ),
+        }[self.op]
+
+        for field_name in required_fields:
+
+            if not getattr(
+                self,
+                field_name,
+            ):
+
+                raise ValueError(
+                    f"op '{self.op}' needs "
+                    f"field '{field_name}'"
+                )
+
         return self
 
 
 class RawGraphOps(BaseModel):
-    ops: list[GraphOp] = Field(default_factory=list)
+
+    ops: list[GraphOp] = Field(
+        default_factory=list
+    )
 
 
-GRAPH_SYSTEM = """You are the graph reasoner of a robot team. You are NOT a planner.
-Each robot wrote its own plan (a list of steps in order). A matching process then linked NEED steps to PASS steps ("handoffs"): the PASS step provides what the NEED step asks for. Several robots may have volunteered for one need; the "candidates" list shows the volunteers ("pass" ids) with their similarity score.
+# ============================================================================
+# LLM prompt
+# ============================================================================
 
-Your job is to check the plan thoroughly and repair problems directly, using ONLY these operations:
-  {"op": "reassign", "need": <NEED step id>, "to_pass": <PASS step id>, "reason": string}
-      Give a NEED to a different volunteer. `to_pass` must be listed in that need's candidates and not already used by another need.
-  {"op": "unmatch", "need": <NEED step id>, "reason": string}
-      Cut a handoff that is wrong (the PASS step does not really provide what the NEED asks for).
-  {"op": "add_order", "before": <step id>, "after": <step id>, "reason": string}
-      Add a cross-robot ordering constraint: `before` must finish before `after` starts. Use it only for steps of DIFFERENT robots when the plan would not work without it (e.g. space must be cleared before furniture is moved, something must be set up before it is used) and it is not already implied by the existing sequence/handoff edges.
+GRAPH_SYSTEM = """
+You are the centralized graph reasoner of a heterogeneous robot team.
 
-You may NOT create, delete or rewrite steps, and you may NOT create a collaboration that no robot volunteered for. Robots keep ownership of what they do and who does it; you only fix connections and ordering.
+You are NOT a planner.
 
-Check every handoff (does the PASS give exactly what the NEED asks for? is another volunteer clearly better?) and every cross-robot dependency. Change only what is necessary; if the plan is already consistent return {"ops": []}.
-Return ONE JSON object: {"ops": [ ... ]}"""
+Each robot independently generated its own local plan.
+The Auction then generated candidate collaboration relations.
+
+Your job is to determine whether those relations form a globally
+consistent dependency graph.
+
+------------------------------------------------------------
+STEP TYPES
+------------------------------------------------------------
+
+LOCAL
+    A robot performs an action locally.
+
+ASK_HELP
+    A robot requests another robot to perform a task.
+
+HELP
+    A robot volunteers to perform a task for another robot.
+
+RECEIVE
+    A robot requests / receives a physical item.
+
+PASS
+    A robot provides / passes a physical item.
+
+Valid collaboration relations are ONLY:
+
+    ASK_HELP <-> HELP
+
+    RECEIVE <-> PASS
+
+------------------------------------------------------------
+CURRENT GRAPH
+------------------------------------------------------------
+
+A confirmed handoff is represented as:
+
+    provider -> requester
+
+For example:
+
+    R2_HELP
+        |
+        v
+    R3_ASK_HELP
+
+The Auction also provides candidate providers for each request.
+
+Candidate providers are the ONLY providers that may be selected.
+
+------------------------------------------------------------
+AVAILABLE OPERATIONS
+------------------------------------------------------------
+
+1. reassign
+
+Replace the current provider of a request.
+
+Format:
+
+{
+    "op": "reassign",
+    "need": "<request step id>",
+    "to_pass": "<candidate provider step id>",
+    "reason": "..."
+}
+
+The `to_pass` MUST already appear in the request's
+candidate list.
+
+It is not allowed to create a new collaboration relation.
+
+The candidate may be either:
+
+    HELP
+    PASS
+
+depending on the request type.
+
+------------------------------------------------------------
+
+2. unmatch
+
+Remove an incorrect collaboration relation.
+
+Format:
+
+{
+    "op": "unmatch",
+    "need": "<request step id>",
+    "reason": "..."
+}
+
+Use this when the confirmed provider does not actually
+satisfy the request.
+
+------------------------------------------------------------
+
+3. add_order
+
+Add a cross-robot ordering dependency.
+
+Format:
+
+{
+    "op": "add_order",
+    "before": "<step id>",
+    "after": "<step id>",
+    "reason": "..."
+}
+
+Use this only when one robot's action must happen before
+another robot's action.
+
+The two steps must belong to different robots.
+
+Do not add an ordering relation if it is already implied
+by the existing dependency graph.
+
+------------------------------------------------------------
+IMPORTANT CONSTRAINTS
+------------------------------------------------------------
+
+You may NOT:
+
+- create a new step
+- delete a step
+- rewrite an action
+- change a robot's action
+- invent a provider
+- create a collaboration that is not in the Auction candidates
+- access private observations or images
+- perform task planning from scratch
+
+You may ONLY modify:
+
+- collaboration relations
+- provider assignment
+- cross-robot ordering relations
+
+------------------------------------------------------------
+WHAT TO CHECK
+------------------------------------------------------------
+
+For every ASK_HELP:
+
+    Does the selected HELP provider actually perform
+    the requested task?
+
+For every RECEIVE:
+
+    Does the selected PASS provider actually provide
+    the requested item?
+
+Also check:
+
+- candidate alternatives
+- collaboration consistency
+- dependency ordering
+- cycles
+- use-before-receive problems
+- unnecessary cross-robot dependencies
+
+Prefer minimal intervention.
+
+If the graph is already consistent:
+
+    {"ops": []}
+
+Return exactly ONE JSON object:
+
+{
+    "ops": [...]
+}
+"""
 
 
-def serialize_for_llm(graph: PlanGraph, report: RuleReport, scope: str = "full") -> str:
-    def brief(n: Node) -> dict:
-        d = {"id": n.id, "type": n.type, "action": n.action}
-        if n.kind:
-            d["kind"] = n.kind
-        if n.item:
-            d["item"] = n.item
-        return d
+# ============================================================================
+# LLM serialization
+# ============================================================================
 
-    agents: dict[str, list[dict]] = {}
-    for a in sorted({n.agent for n in graph.nodes.values()}):
-        seq = graph.agent_sequence(a)
-        agents[a] = [brief(n) for n in seq if (scope == "full" or n.type != "LOCAL")]
-    cands = {}
-    for need, lst in graph.candidates.items():
-        if not graph.nodes[need].active:
+def serialize_for_llm(
+    graph: PlanGraph,
+    report: RuleReport,
+    scope: str = "full",
+) -> str:
+
+    def brief(node: Node) -> dict:
+
+        data = {
+            "id": node.id,
+            "type": node.type,
+            "action": node.action,
+        }
+
+        if node.kind:
+            data["kind"] = node.kind
+
+        if node.item:
+            data["item"] = node.item
+
+        return data
+
+    # ------------------------------------------------------------
+    # Robot-local plans
+    # ------------------------------------------------------------
+
+    robots: dict[str, list[dict]] = {}
+
+    for agent in sorted(
+        {
+            node.agent
+            for node in graph.nodes.values()
+        }
+    ):
+
+        sequence = graph.agent_sequence(
+            agent
+        )
+
+        robots[agent] = [
+            brief(node)
+            for node in sequence
+            if (
+                scope == "full"
+                or node.type != "LOCAL"
+            )
+        ]
+
+    # ------------------------------------------------------------
+    # Candidate edges
+    # ------------------------------------------------------------
+
+    candidates = {}
+
+    for request_id, candidate_list in graph.candidates.items():
+
+        if request_id not in graph.nodes:
             continue
-        cands[need] = [{"pass": c["pass"], "score": c["score"], "action": graph.nodes[c["pass"]].action,
-                        "used_by_other_need": c["pass"] in graph.handoff.values() and graph.handoff.get(need) != c["pass"]} for c in lst]
+
+        if not graph.nodes[request_id].active:
+            continue
+
+        formatted = []
+
+        for candidate in candidate_list:
+
+            provider_id = candidate["pass"]
+
+            if provider_id not in graph.nodes:
+                continue
+
+            provider = graph.nodes[provider_id]
+
+            used_by_other = (
+                provider_id in graph.handoff.values()
+                and graph.handoff.get(request_id)
+                != provider_id
+            )
+
+            formatted.append(
+                {
+                    "pass": provider_id,
+                    "score": candidate["score"],
+                    "type": provider.type,
+                    "action": provider.action,
+                    "item": provider.item,
+                    "used_by_other_need": used_by_other,
+                }
+            )
+
+        candidates[request_id] = formatted
+
+    # ------------------------------------------------------------
+    # Confirmed handoffs
+    # ------------------------------------------------------------
+
+    handoffs = []
+
+    for request_id, provider_id in sorted(
+        graph.handoff.items()
+    ):
+
+        if request_id not in graph.nodes:
+            continue
+
+        if provider_id not in graph.nodes:
+            continue
+
+        if not graph.nodes[request_id].active:
+            continue
+
+        if not graph.nodes[provider_id].active:
+            continue
+
+        handoffs.append(
+            {
+                "need": request_id,
+                "pass": provider_id,
+                "need_type": graph.nodes[request_id].type,
+                "pass_type": graph.nodes[provider_id].type,
+                "score": graph.handoff_score.get(
+                    request_id
+                ),
+            }
+        )
+
+    # ------------------------------------------------------------
+    # Collaboration graph
+    # ------------------------------------------------------------
+
+    collaboration_edges = []
+
+    for edge in graph.edges(
+        include_candidates=True
+    ):
+
+        if edge.kind != "collaboration":
+            continue
+
+        collaboration_edges.append(
+            {
+                "src": edge.src,
+                "dst": edge.dst,
+                "status": edge.status,
+            }
+        )
+
+    # ------------------------------------------------------------
+    # Final payload
+    # ------------------------------------------------------------
+
     payload = {
         "task": graph.task,
-        "robots": agents,
-        "handoffs": [{"need": n, "pass": p, "score": graph.handoff_score.get(n)} for n, p in sorted(graph.handoff.items()) if graph.nodes[n].active and graph.nodes[p].active],
-        "collaboration_edges": [{"src": e.src, "dst": e.dst, "status": e.status, "score": graph.handoff_score.get(e.dst)} for e in graph.edges(include_candidates=True) if e.kind == "collaboration"],
-        "candidates": cands,
-        "unresolved_needs": report.unresolved_needs,
+
+        "robots": robots,
+
+        "handoffs": handoffs,
+
+        "collaboration_edges": collaboration_edges,
+
+        "candidates": candidates,
+
+        "unresolved_requests": report.unresolved_needs,
+
         "rule_warnings": report.warnings,
     }
-    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        indent=2,
+    )
 
 
-def apply_op(graph: PlanGraph, op: GraphOp) -> tuple[bool, str]:
-    """Validate and apply one operation; revert it if it would create a cycle."""
+# ============================================================================
+# Apply Graph Operation
+# ============================================================================
+
+def apply_op(
+    graph: PlanGraph,
+    op: GraphOp,
+) -> tuple[bool, str]:
+
     nodes = graph.nodes
-    snap = graph.snapshot()
+
+    snapshot = graph.snapshot()
+
+    # ========================================================================
+    # REASSIGN
+    # ========================================================================
 
     if op.op == "reassign":
-        need, to_pass = op.need, op.to_pass
-        if need not in nodes or nodes[need].type != "NEED" or not nodes[need].active:
-            return False, "unknown or inactive NEED step"
-        if to_pass not in nodes or nodes[to_pass].type != "PASS":
-            return False, "unknown PASS step"
-        cand = {c["pass"]: c["score"] for c in graph.candidates.get(need, [])}
-        if to_pass not in cand:
-            return False, "not a self-nominated candidate for this need (no new collaboration allowed)"
-        if graph.handoff.get(need) == to_pass:
-            return False, "already matched to that step"
-        if to_pass in graph.handoff.values():
-            return False, "that PASS step already serves another need"
-        old = graph.handoff.get(need)
-        if old:
-            nodes[old].active = False  # old provider withdraws (stays a candidate)
-        nodes[to_pass].active = True   # new provider re-instates its own volunteering step
-        graph.handoff[need] = to_pass
-        graph.handoff_score[need] = cand[to_pass]
+
+        request_id = op.need
+        provider_id = op.to_pass
+
+        if request_id not in nodes:
+
+            return (
+                False,
+                "unknown request step",
+            )
+
+        request = nodes[request_id]
+
+        # ------------------------------------------------------------
+        # Request type validation
+        # ------------------------------------------------------------
+
+        if request.type not in {
+            "ASK_HELP",
+            "RECEIVE",
+        }:
+
+            return (
+                False,
+                "step is not a collaboration request",
+            )
+
+        if not request.active:
+
+            return (
+                False,
+                "request step is inactive",
+            )
+
+        # ------------------------------------------------------------
+        # Provider validation
+        # ------------------------------------------------------------
+
+        if provider_id not in nodes:
+
+            return (
+                False,
+                "unknown provider step",
+            )
+
+        provider = nodes[provider_id]
+
+        expected_provider_type = {
+            "ASK_HELP": "HELP",
+            "RECEIVE": "PASS",
+        }[request.type]
+
+        if provider.type != expected_provider_type:
+
+            return (
+                False,
+                (
+                    f"invalid provider type: "
+                    f"{request.type} requires "
+                    f"{expected_provider_type}"
+                ),
+            )
+
+        # ------------------------------------------------------------
+        # Candidate validation
+        #
+        # VERY IMPORTANT:
+        # Graph Reasoning cannot invent a new collaboration.
+        # ------------------------------------------------------------
+
+        candidate_scores = {
+            candidate["pass"]: candidate["score"]
+            for candidate in graph.candidates.get(
+                request_id,
+                [],
+            )
+        }
+
+        if provider_id not in candidate_scores:
+
+            return (
+                False,
+                (
+                    "provider is not an Auction-generated "
+                    "candidate for this request"
+                ),
+            )
+
+        # ------------------------------------------------------------
+        # Same robot is not allowed
+        # ------------------------------------------------------------
+
+        if (
+            provider.agent
+            == request.agent
+        ):
+
+            return (
+                False,
+                "request and provider belong to the same robot",
+            )
+
+        # ------------------------------------------------------------
+        # Provider already serving another request
+        # ------------------------------------------------------------
+
+        current_request = None
+
+        for rid, pid in graph.handoff.items():
+
+            if (
+                pid == provider_id
+                and rid != request_id
+            ):
+
+                current_request = rid
+                break
+
+        if current_request is not None:
+
+            return (
+                False,
+                (
+                    "provider is already assigned "
+                    f"to request {current_request}"
+                ),
+            )
+
+        # ------------------------------------------------------------
+        # Remove old provider
+        # ------------------------------------------------------------
+
+        old_provider = graph.handoff.get(
+            request_id
+        )
+
+        if old_provider is not None:
+
+            if old_provider in nodes:
+
+                nodes[old_provider].active = False
+
+        # ------------------------------------------------------------
+        # Activate new provider
+        # ------------------------------------------------------------
+
+        provider.active = True
+
+        graph.handoff[request_id] = provider_id
+
+        graph.handoff_score[request_id] = (
+            candidate_scores[provider_id]
+        )
+
+    # ========================================================================
+    # UNMATCH
+    # ========================================================================
 
     elif op.op == "unmatch":
-        need = op.need
-        if need not in graph.handoff:
-            return False, "that need has no handoff"
-        nodes[graph.handoff[need]].active = False
-        del graph.handoff[need]
-        graph.handoff_score.pop(need, None)
 
-    else:  # add_order
-        a, b = op.before, op.after
-        if a not in nodes or b not in nodes or not nodes[a].active or not nodes[b].active:
-            return False, "unknown or inactive step"
-        if nodes[a].agent == nodes[b].agent:
-            return False, "same robot: its own order is owned by that robot"
-        if reachable(graph, a, b):
-            return False, "already implied by existing edges"
-        graph.extra_collaboration.append((a, b))
+        request_id = op.need
+
+        if request_id not in graph.handoff:
+
+            return (
+                False,
+                "request has no confirmed handoff",
+            )
+
+        provider_id = graph.handoff[
+            request_id
+        ]
+
+        del graph.handoff[
+            request_id
+        ]
+
+        graph.handoff_score.pop(
+            request_id,
+            None,
+        )
+
+        if provider_id in nodes:
+
+            nodes[provider_id].active = False
+
+    # ========================================================================
+    # ADD ORDER
+    # ========================================================================
+
+    else:
+
+        before = op.before
+        after = op.after
+
+        if (
+            before not in nodes
+            or after not in nodes
+        ):
+
+            return (
+                False,
+                "unknown step",
+            )
+
+        if (
+            not nodes[before].active
+            or not nodes[after].active
+        ):
+
+            return (
+                False,
+                "step is inactive",
+            )
+
+        # ------------------------------------------------------------
+        # Cross-robot only
+        # ------------------------------------------------------------
+
+        if (
+            nodes[before].agent
+            == nodes[after].agent
+        ):
+
+            return (
+                False,
+                "same robot: local sequence already defines the order",
+            )
+
+        # ------------------------------------------------------------
+        # Already implied?
+        # ------------------------------------------------------------
+
+        if reachable(
+            graph,
+            before,
+            after,
+        ):
+
+            return (
+                False,
+                "ordering is already implied",
+            )
+
+        # ------------------------------------------------------------
+        # Add
+        # ------------------------------------------------------------
+
+        graph.extra_collaboration.append(
+            (
+                before,
+                after,
+            )
+        )
+
+    # ========================================================================
+    # Cycle guard
+    # ========================================================================
 
     if find_cycle(graph) is not None:
-        graph.restore(snap)
-        return False, "would create a cycle (reverted)"
+
+        graph.restore(snapshot)
+
+        return (
+            False,
+            "operation would create a cycle; reverted",
+        )
+
     return True, "ok"
 
 
-async def llm_reason(graph: PlanGraph, report: RuleReport, llm: BaseLLM, log: EventLog, *, scope: str = "full", max_ops: int = 8, max_retries: int = 2) -> list[dict]:
+# ============================================================================
+# LLM reasoning
+# ============================================================================
+
+async def llm_reason(
+    graph: PlanGraph,
+    report: RuleReport,
+    llm: BaseLLM,
+    log: EventLog,
+    *,
+    scope: str = "full",
+    max_ops: int = 8,
+    max_retries: int = 2,
+) -> list[dict]:
+
     raw: RawGraphOps = await call_validated(
-        llm, log, phase="graph", who="reasoner", system=GRAPH_SYSTEM, user=serialize_for_llm(graph, report, scope),
-        parse=RawGraphOps.model_validate, images=None, max_retries=max_retries,  # text only: no observations reach the center
+        llm,
+        log,
+        phase="graph",
+        who="reasoner",
+        system=GRAPH_SYSTEM,
+        user=serialize_for_llm(
+            graph,
+            report,
+            scope,
+        ),
+        parse=RawGraphOps.model_validate,
+        images=None,
+        max_retries=max_retries,
     )
+
     records = []
+
+    # ------------------------------------------------------------
+    # Apply operations
+    # ------------------------------------------------------------
+
     for op in raw.ops[:max_ops]:
-        ok, why = apply_op(graph, op)
-        rec = {**op.model_dump(exclude_none=True), "status": "applied" if ok else "rejected", "why": why}
-        records.append(rec)
-        log.log("graph", "reasoner", f"op_{rec['status']}", **{k: v for k, v in rec.items() if k != "status"})
+
+        ok, reason = apply_op(
+            graph,
+            op,
+        )
+
+        record = {
+            **op.model_dump(
+                exclude_none=True
+            ),
+            "status": (
+                "applied"
+                if ok
+                else "rejected"
+            ),
+            "why": reason,
+        }
+
+        records.append(record)
+
+        log.log(
+            "graph",
+            "reasoner",
+            (
+                "op_applied"
+                if ok
+                else "op_rejected"
+            ),
+            **{
+                key: value
+                for key, value in record.items()
+                if key != "status"
+            },
+        )
+
+    # ------------------------------------------------------------
+    # Max-op overflow
+    # ------------------------------------------------------------
+
     for op in raw.ops[max_ops:]:
-        records.append({**op.model_dump(exclude_none=True), "status": "rejected", "why": f"more than max_ops={max_ops}"})
+
+        records.append(
+            {
+                **op.model_dump(
+                    exclude_none=True
+                ),
+                "status": "rejected",
+                "why": (
+                    f"more than max_ops={max_ops}"
+                ),
+            }
+        )
+
     return records
 
 
-# =========================================================================== entry point
+# ============================================================================
+# Result
+# ============================================================================
+
 @dataclass
 class GraphResult:
+
     graph: PlanGraph
-    report: RuleReport            # final report (after the guard pass)
+
+    report: RuleReport
+
     first_report: RuleReport
+
     ops: list[dict]
+
     stats: dict
 
+
+# ============================================================================
+# Main entry point
+# ============================================================================
 
 async def graph_reasoning(
     task: str,
@@ -419,31 +1712,165 @@ async def graph_reasoning(
     scope: str = "full",
     max_ops: int = 8,
 ) -> GraphResult:
-    graph = PlanGraph(task, plans, auction)
-    initial_handoffs = len(graph.handoff)
-    first = rule_verify(graph)
-    log.log("graph", "rules", "verified", fixes=len(first.fixes), warnings=len(first.warnings), unresolved=len(first.unresolved_needs))
+
+    # ----------------------------------------------------------------
+    # Build graph
+    # ----------------------------------------------------------------
+
+    graph = PlanGraph(
+        task,
+        plans,
+        auction,
+    )
+
+    initial_handoffs = len(
+        graph.handoff
+    )
+
+    # ----------------------------------------------------------------
+    # Layer 1
+    # ----------------------------------------------------------------
+
+    first_report = rule_verify(
+        graph
+    )
+
+    log.log(
+        "graph",
+        "rules",
+        "verified",
+        fixes=len(first_report.fixes),
+        warnings=len(first_report.warnings),
+        unresolved=len(
+            first_report.unresolved_needs
+        ),
+    )
+
+    # ----------------------------------------------------------------
+    # Layer 2
+    # ----------------------------------------------------------------
 
     ops: list[dict] = []
-    final = first
-    if use_llm:
-        ops = await llm_reason(graph, first, llm, log, scope=scope, max_ops=max_ops)
-        final = rule_verify(graph)  # guard: re-check structure after the LLM edits
-        log.log("graph", "rules", "verified_after_llm", fixes=len(final.fixes), warnings=len(final.warnings), unresolved=len(final.unresolved_needs))
 
-    applied = [o for o in ops if o["status"] == "applied"]
-    changed_matches = sum(1 for o in applied if o["op"] in ("reassign", "unmatch"))
+    final_report = first_report
+
+    if use_llm:
+
+        ops = await llm_reason(
+            graph,
+            first_report,
+            llm,
+            log,
+            scope=scope,
+            max_ops=max_ops,
+        )
+
+        # ------------------------------------------------------------
+        # Guard pass
+        # ------------------------------------------------------------
+
+        final_report = rule_verify(
+            graph
+        )
+
+        log.log(
+            "graph",
+            "rules",
+            "verified_after_llm",
+            fixes=len(
+                final_report.fixes
+            ),
+            warnings=len(
+                final_report.warnings
+            ),
+            unresolved=len(
+                final_report.unresolved_needs
+            ),
+        )
+
+    # ----------------------------------------------------------------
+    # Statistics
+    # ----------------------------------------------------------------
+
+    applied = [
+        operation
+        for operation in ops
+        if operation["status"] == "applied"
+    ]
+
+    changed_matches = sum(
+        1
+        for operation in applied
+        if operation["op"]
+        in {
+            "reassign",
+            "unmatch",
+        }
+    )
+
     stats = {
         "ops_proposed": len(ops),
+
         "ops_applied": len(applied),
-        "ops_rejected": len(ops) - len(applied),
-        "reassigned": sum(1 for o in applied if o["op"] == "reassign"),
-        "unmatched": sum(1 for o in applied if o["op"] == "unmatch"),
-        "orders_added": sum(1 for o in applied if o["op"] == "add_order"),
-        "rule_fixes": len(first.fixes) + (len(final.fixes) if use_llm else 0),
+
+        "ops_rejected": (
+            len(ops) - len(applied)
+        ),
+
+        "reassigned": sum(
+            1
+            for operation in applied
+            if operation["op"]
+            == "reassign"
+        ),
+
+        "unmatched": sum(
+            1
+            for operation in applied
+            if operation["op"]
+            == "unmatch"
+        ),
+
+        "orders_added": sum(
+            1
+            for operation in applied
+            if operation["op"]
+            == "add_order"
+        ),
+
+        "rule_fixes": (
+            len(first_report.fixes)
+            + (
+                len(final_report.fixes)
+                if use_llm
+                else 0
+            )
+        ),
+
         "initial_handoffs": initial_handoffs,
-        "final_handoffs": len(graph.handoff),
-        "modification_ratio": round(changed_matches / max(1, initial_handoffs), 4),  # share of auction matches the graph changed
-        "unresolved_needs": len(final.unresolved_needs),
+
+        "final_handoffs": len(
+            graph.handoff
+        ),
+
+        "modification_ratio": round(
+            changed_matches
+            / max(
+                1,
+                initial_handoffs,
+            ),
+            4,
+        ),
+
+        "unresolved_needs": len(
+            final_report.unresolved_needs
+        ),
     }
-    return GraphResult(graph=graph, report=final, first_report=first, ops=ops, stats=stats)
+
+    return GraphResult(
+        graph=graph,
+        report=final_report,
+        first_report=first_report,
+        ops=ops,
+        stats=stats,
+    )
