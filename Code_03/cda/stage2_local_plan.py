@@ -17,7 +17,7 @@ import re
 from .llm import BaseLLM
 from .log import EventLog
 from .prompts import PLAN_FIX, PLAN_USER, _j, indexed, plan_system
-from .schemas import (ASK_HELP, LOCAL, RECEIVE, REQUEST_TYPES, Node, Offer, TaskConfig,
+from .schemas import (ASK_HELP, LOCAL, PASS, RECEIVE, REQUEST_TYPES, Node, Offer, TaskConfig,
                       agent_num, norm, snap_duration)
 
 
@@ -47,9 +47,17 @@ def validate(raw_steps: list[dict], agent: str, offers: dict[str, Offer], cfg: T
             "location": str(s.get("location") or me.profile.room),
             "duration": snap_duration(s.get("duration", 2)),
         }
-        if t not in {LOCAL} | REQUEST_TYPES:
-            errors.append(f"step {i}: type '{t}' is not allowed (use LOCAL, ASK_HELP, RECEIVE)")
+        if t not in {LOCAL, PASS} | REQUEST_TYPES:
+            errors.append(f"step {i}: type '{t}' is not allowed (use LOCAL, ASK_HELP, RECEIVE, PASS)")
             continue
+        if t == PASS:                                   # an OFFER: the receiver decides in Stage 3
+            step["uses"] = None
+            step["location"] = me.profile.room
+            if step["target"] not in cfg.ids or step["target"] == agent:
+                v.append(f"PASS needs a target among {[x for x in cfg.ids if x != agent]}, got {step['target']}")
+            if not step["item"] or norm(step["item"]) not in {norm(x) for x in own.has_items}:
+                v.append(f"PASS item '{step['item']}' must be copied from YOUR has_items")
+            step["action"] = step["action"] or f"pass {step['item']} to {step['target']}"
 
         if goals is not None:
             sv = s.get("serves")
@@ -83,7 +91,7 @@ def validate(raw_steps: list[dict], agent: str, offers: dict[str, Offer], cfg: T
                          f"own room ('{me.profile.room}'). For objects from another room write RECEIVE; "
                          f"for work your body cannot do, write ASK_HELP")
             step["location"] = me.profile.room
-        else:
+        elif t in REQUEST_TYPES:
             step["uses"] = None
             tgt = step["target"]
             if tgt not in cfg.ids or tgt == agent:
@@ -154,13 +162,17 @@ async def make_local_plan(cfg: TaskConfig, agent: str, offers: dict[str, Offer],
     n = agent_num(agent)
     nodes = [Node(id=f"r{n}_s{k}", agent=agent, type=s["type"], action=s["action"], item=s["item"],
                   target=s["target"], uses=s["uses"], location=s["location"], duration=s["duration"],
-                  origin="local", violations=s["violations"], serves=s.get("serves"))
+                  origin="offer" if s["type"] == PASS else "local", violations=s["violations"],
+                  serves=s.get("serves"))
              for k, s in enumerate(steps, start=1)]
     raw_to_id = {s["_raw_index"]: nodes[k].id for k, s in enumerate(steps)}
     for s, node in zip(steps, nodes):
         if s["enables"] is not None:
             node.enables = raw_to_id.get(s["enables"])
         # a request that is not a dependency of own work is withdrawn before broadcast
+        if node.type == PASS and node.violations:          # invalid offer: withdrawn before broadcast
+            node.status = "dropped"
+            log.log("plan", agent, "offer_withdrawn", node=node.id)
         if node.type in REQUEST_TYPES and node.enables is None:
             node.status = "dropped"
             log.log("plan", agent, "request_withdrawn", node=node.id)
