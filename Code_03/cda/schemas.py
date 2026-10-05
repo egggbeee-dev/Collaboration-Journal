@@ -65,6 +65,7 @@ class TaskConfig:
     deadline_min: int
     agents: list[AgentInput]
     travel_min: int = 2        # added when a HELP step happens in another robot's room
+    handoff_min: int = 2       # an object handed over at the room doors (RECEIVE <- PASS)
 
     @classmethod
     def load(cls, path: str | Path) -> "TaskConfig":
@@ -75,11 +76,13 @@ class TaskConfig:
             imgs = [str((path.parent / p).resolve()) if not Path(p).is_absolute() else p
                     for p in a.get("images", [])]
             agents.append(AgentInput(a["id"], Profile(**a["profile"]), imgs, a.get("instruction", "")))
-        return cls(d["task_id"], d["task"], d["deadline_min"], agents, d.get("travel_min", 2))
+        return cls(d["task_id"], d["task"], d["deadline_min"], agents, d.get("travel_min", 2),
+                   d.get("handoff_min", 2))
 
     @classmethod
     def from_notebook(cls, task: str, agents: list[dict], deadline_min: int = 20,
-                      task_id: str = "task", travel_min: int = 2) -> "TaskConfig":
+                      task_id: str = "task", travel_min: int = 2,
+                      handoff_min: int = 2) -> "TaskConfig":
         """agents: [{"room", "mobile", "capability", "images", "hidden_info", "payload_kg"?}, ...]
         Robots are named R1..Rn in the given order. `hidden_info` (str or list of lines) becomes
         the robot's private text about what it cannot see / knows only itself."""
@@ -91,7 +94,7 @@ class TaskConfig:
                                                    payload_kg=float(a.get("payload_kg", 0) or 0),
                                                    embodiment=a["capability"]),
                                   list(a.get("images", [])), hid))
-        return cls(task_id, task, deadline_min, out, travel_min)
+        return cls(task_id, task, deadline_min, out, travel_min, handoff_min)
 
     def agent(self, aid: str) -> AgentInput:
         return next(a for a in self.agents if a.id == aid)
