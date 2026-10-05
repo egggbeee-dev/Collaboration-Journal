@@ -112,11 +112,21 @@ def validate(raw_steps: list[dict], agent: str, offers: dict[str, Offer], cfg: T
         step["violations"] = v
         step["_raw_index"] = i
         step["enables"] = s.get("enables")
+        step["prepared_by"] = s.get("prepared_by") if t == PASS else None
         cleaned.append(step)
     # second pass: "enables" must point to an own later LOCAL step (indices refer to raw_steps)
     raw_types = [str(x.get("type", "")).upper().strip() for x in (raw_steps or [])]
     for step in cleaned:
         i = step["_raw_index"]
+        pb = step.get("prepared_by")
+        if step["type"] == PASS and pb is not None:
+            if isinstance(pb, str) and pb.strip().isdigit():
+                pb = int(pb.strip())
+            if not isinstance(pb, int) or not (0 <= pb < i) or raw_types[pb] != LOCAL:
+                step["violations"].append(f"PASS 'prepared_by' must be the index of one of YOUR earlier LOCAL "
+                                          f"steps (got {pb})")
+                pb = None
+            step["prepared_by"] = pb
         if step["type"] in REQUEST_TYPES:
             e = step["enables"]
             if isinstance(e, str) and e.strip().isdigit():
@@ -169,6 +179,8 @@ async def make_local_plan(cfg: TaskConfig, agent: str, offers: dict[str, Offer],
     for s, node in zip(steps, nodes):
         if s["enables"] is not None:
             node.enables = raw_to_id.get(s["enables"])
+        if s.get("prepared_by") is not None:
+            node.prepared_by = raw_to_id.get(s["prepared_by"])
         # a request that is not a dependency of own work is withdrawn before broadcast
         if node.type == PASS and node.violations:          # invalid offer: withdrawn before broadcast
             node.status = "dropped"
