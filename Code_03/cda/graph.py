@@ -18,7 +18,7 @@ import re
 
 import networkx as nx
 
-from .schemas import (ASK_HELP, CONFIRMED, HELP, LOCAL, PASS, PROPOSED, PROVIDER_TYPES, RECEIVE,
+from .schemas import (ASK_HELP, CONFIRMED, HELP, LOCAL, PROPOSED, PROVIDER_TYPES, RECEIVE,
                       REQUEST_TYPES, SEQ, Edge, Node, Offer, TaskConfig, norm)
 
 _STOP = set("a an the to of on in at into onto from for with and or by it its them their this that "
@@ -394,30 +394,24 @@ class PlanGraph:
                 self.n_released += 1
 
     def schedule(self) -> None:
-        """Times from durations + dependencies. Each robot's current room is tracked, so travel
-        (cfg.travel_min) is added only when a mobile robot actually changes room.
-        ASK_HELP ends when its helper ends. RECEIVE: the receiver goes to where the item was put,
-        waits for the PASS, then takes `duration`."""
+        """Space-separated home. Every robot works in its own room; the only trips are HELP steps
+        (travel_min to get there) and the way back before the next step at home (travel_min).
+        Objects are handed over at the doors: RECEIVE ends handoff_min after its PASS, plus duration.
+        ASK_HELP ends when its helper ends."""
         g = self.nx()
-        cur = {a.id: a.profile.room for a in self.cfg.agents}
+        home = {a.id: a.profile.room for a in self.cfg.agents}
+        cur = dict(home)
         mobile = {a.id: a.profile.mobile for a in self.cfg.agents}
         for nid in nx.topological_sort(g):
             n = self.nodes[nid]
             seq_preds = [p for p in g.predecessors(nid) if g.edges[p, nid]["kind"] == SEQ]
             collab_preds = [p for p in g.predecessors(nid) if g.edges[p, nid]["kind"] != SEQ]
-            if n.type == ASK_HELP:   # while waiting, a mobile robot moves to where its enabled step happens
-                nxt = self.nodes.get(n.enables) if n.enables else None
-                place = (nxt.location if nxt else None) if mobile[n.agent] else None
-            elif n.type == PASS:
-                if mobile[n.agent]:                           # mobile giver brings it to the receiver
-                    place = n.location
-                else:                                         # immobile giver: handoff spot where it is
-                    place = None
-                    n.location = cur[n.agent]
-            elif n.type == RECEIVE:
-                place = self.nodes[collab_preds[0]].location if collab_preds else n.location
-            else:
+            if n.type == HELP:
                 place = n.location or cur[n.agent]
+            elif n.type == ASK_HELP:
+                place = None                              # waiting at home
+            else:
+                place = home[n.agent]                     # LOCAL / PASS / RECEIVE happen at home
             n.travel = 0
             if place and norm(place) != norm(cur[n.agent]):
                 if mobile[n.agent]:
@@ -427,9 +421,11 @@ class PlanGraph:
                     self.warnings.append({"issue": "immobile robot would have to move", "node": nid,
                                           "from": cur[n.agent], "to": place})
             n.t_start = max([self.nodes[p].t_end for p in seq_preds] or [0])
-            if n.type in REQUEST_TYPES:
-                ready = max([n.t_start + n.travel] + [self.nodes[p].t_end for p in collab_preds])
-                n.t_end = ready + (n.duration if n.type == RECEIVE else 0)
+            if n.type == ASK_HELP:
+                n.t_end = max([n.t_start] + [self.nodes[p].t_end for p in collab_preds])
+            elif n.type == RECEIVE:
+                arrive = [self.nodes[p].t_end + self.cfg.handoff_min for p in collab_preds]
+                n.t_end = max([n.t_start + n.travel] + arrive) + n.duration
             else:
                 n.t_end = n.t_start + n.travel + n.duration
 
