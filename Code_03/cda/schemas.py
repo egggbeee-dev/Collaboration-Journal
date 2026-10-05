@@ -113,6 +113,7 @@ class Offer:
     has_items: list[str]
     need_from_others: list[str]
     intends: list[str] = field(default_factory=list)   # parts of the task I plan to take (public)
+    suggests: list[str] = field(default_factory=list)  # "Object: use" from my room for the task (public)
     # private (never broadcast)
     obs_scope: str = ""
     cannot_do: list[str] = field(default_factory=list)
@@ -121,7 +122,7 @@ class Offer:
     def public(self) -> dict:
         return {"agent": self.agent, "capability": self.capability, "can_do": self.can_do,
                 "has_items": self.has_items, "need_from_others": self.need_from_others,
-                "intends": self.intends}
+                "intends": self.intends, "suggests": self.suggests}
 
     def to_dict(self) -> dict:
         return asdict(self)
