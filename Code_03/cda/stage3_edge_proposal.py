@@ -137,13 +137,10 @@ async def edge_proposal(cfg: TaskConfig, plans: dict[str, list[Node]], offers: d
                 location = req.location
             else:
                 item = str(j.get("item") or req.item or "")
-                req_mobile = cfg.agent(req.agent).profile.mobile
                 if stock[agent][norm(item)] <= 0:
                     problem = f"item '{item}' not available (not in has_items or already promised)"
-                elif not me.profile.mobile and not req_mobile:
-                    problem = "neither robot can move, so the object cannot change rooms"
                 action = action or f"pass {item} to {req.agent}"
-                location = req.location if me.profile.mobile else me.profile.room
+                location = me.profile.room          # handed over at the room door
             if problem:
                 rec["result"] = f"rejected_by_check: {problem}"
                 record.append(rec)
