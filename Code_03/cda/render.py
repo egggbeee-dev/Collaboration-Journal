@@ -23,9 +23,9 @@ def _line(g: PlanGraph, nid: str) -> str:
         if serves:
             body += f" (also serves {', '.join(serves)}'s request)"
         if n.travel:
-            body += f" [+{n.travel}m travel to {n.location}]"
-    if n.type == RECEIVE and n.travel:
-        body += f" [+{n.travel}m travel to {g.nodes[prov[0].src].location if prov else n.location}]"
+            body += f" [+{n.travel}m back to {n.location}]"
+    if n.type == RECEIVE and prov:
+        body += f" [door handoff {g.cfg.handoff_min}m]"
     return f"[t={n.t_start:>2}–{n.t_end:<2}] {n.agent} [{n.type}] {body}  ({nid})"
 
 
@@ -76,6 +76,8 @@ def metrics(g: PlanGraph, plan_meta: dict, llm_usage: dict) -> dict:
         "n_served_by_own_existing_step": sum(1 for e in final_collab if g.nodes[e.src].type == "LOCAL"),
         "n_duplicates_merged": g.n_merged,
         "n_duplicates_dropped": g.n_dup_dropped,
+        "n_redundant_branches_released": g.n_released,
+        "n_requests_moved_later": g.n_tightened,
         "n_warnings": len(g.warnings),
         "plan_fix_rounds": {a: m["fix_rounds"] for a, m in plan_meta.items()},
         "graph_ops_applied": sum(o["applied"] for o in g.ops_log),
