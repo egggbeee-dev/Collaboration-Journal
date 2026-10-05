@@ -23,6 +23,7 @@ from .schemas import (ASK_HELP, LOCAL, RECEIVE, REQUEST_TYPES, Node, Offer, Task
 
 # No exploration in this setting, and movement is added by the scheduler: steps that only look,
 # check or search for something do not change the world and are not allowed.
+_MOVE_ONLY = re.compile(r"^\s*(go|move|walk|head|travel|return|navigate|come)\s+(back\s+)?(to|into)\b", re.I)
 _OBSERVE = re.compile(r"\b(check|checks|checking|search|searching|look for|looking for|find|finding|"
                       r"inspect|verify|scan|locate|explore|availability)\b", re.I)
 
@@ -69,7 +70,7 @@ def validate(raw_steps: list[dict], agent: str, offers: dict[str, Offer], cfg: T
         if t == LOCAL and any(re.search(rf"\b{o}\b", step["action"], re.I) for o in others):
             v.append(f"LOCAL '{step['action']}' hands something to another robot. Do not plan handoffs: "
                      f"the receiver writes RECEIVE and you answer later with a PASS")
-        if t in (LOCAL, ASK_HELP) and _OBSERVE.search(step["action"]):
+        if t in (LOCAL, ASK_HELP) and (_OBSERVE.search(step["action"]) or _MOVE_ONLY.search(step["action"])):
             v.append(f"{t} '{step['action']}' only looks/checks/searches. Robots cannot explore and "
                      f"movement is added automatically: write only steps that change the room "
                      f"(what the others can see is in their offers)")
@@ -77,9 +78,11 @@ def validate(raw_steps: list[dict], agent: str, offers: dict[str, Offer], cfg: T
             u = step["uses"]
             if not isinstance(u, int) or not (0 <= u < len(own.can_do)):
                 v.append(f"LOCAL '{step['action']}' cites uses={u}, not a valid can_do index")
-            if not me.profile.mobile and norm(step["location"]) != norm(me.profile.room):
-                v.append(f"LOCAL '{step['action']}' is in '{step['location']}' but you cannot leave "
-                         f"'{me.profile.room}'")
+            if norm(step["location"]) != norm(me.profile.room):
+                v.append(f"LOCAL '{step['action']}' is in '{step['location']}', but you work only in your "
+                         f"own room ('{me.profile.room}'). For objects from another room write RECEIVE; "
+                         f"for work your body cannot do, write ASK_HELP")
+            step["location"] = me.profile.room
         else:
             step["uses"] = None
             tgt = step["target"]
@@ -89,6 +92,7 @@ def validate(raw_steps: list[dict], agent: str, offers: dict[str, Offer], cfg: T
             if t == ASK_HELP and not step["action"]:
                 v.append("ASK_HELP needs an action")
             if t == RECEIVE:
+                step["location"] = me.profile.room
                 if not step["item"]:
                     v.append("RECEIVE needs an item")
                 elif step["target"] in offers and norm(step["item"]) not in \
