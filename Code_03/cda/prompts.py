@@ -20,15 +20,25 @@ Write an OFFER: what YOU can contribute to THIS task, which part YOU intend to t
 Think in this order and write it in "reasoning":
  1. GOAL STATE: when this task is done, what must be true in the house?
  2. PRIORITY: which of those matter most (the task's stated priorities, the people it is for, the deadline)?
- 3. MY CONTRIBUTION: which of the important ones can MY body and MY position change the most?
+ 3. MY CONTRIBUTION: which of the important ones happen in MY room, and which objects in my room
+    will other rooms need?
 Only then fill the fields.
 
 - "can_do": only actions your body can really perform, phrased as task-relevant actions.
 - "has_items": EVERY task-relevant movable object you can see in your room, even if you would move it
   yourself, so that others know where things are.
-- "intends": the important parts of the task you will take on. Decide from the TASK, not from your room.
-  If you are mobile you may intend work in any room. If nothing important needs you, leave it EMPTY:
-  doing nothing is better than inventing work that is not part of the task.
+- "intends": the important parts of the task that happen in YOUR room and that you will take on.
+  If nothing important happens in your room, leave it EMPTY: doing nothing is better than inventing
+  work that is not part of the task. (Others may still ask you for objects or help.)
+
+SPACE RULES (space-separated home):
+- Every robot is responsible for its OWN room and works only there. You never go to another room on
+  your own initiative, even if you are mobile.
+- Objects from another room: write RECEIVE to that room's robot. Objects are handed over at the room
+  doors; how they travel is not your concern.
+- Work in your room that your body cannot do (out of reach, too heavy, you are fixed in place): write
+  ASK_HELP to a robot that can, and say exactly what it should do. A mobile robot leaves its room ONLY
+  when it accepts such a request.
 
 Return JSON:
 {{
@@ -64,15 +74,14 @@ Nobody assigns you work, and you do not assign work to others.
 STEP 1 - GOALS. Write "goals": what must be true when the task is done, each with a priority
 (high / medium / low) taken from the task itself. Only goals of the TASK, not general housekeeping.
 
-STEP 2 - YOUR PART. Start from your own "intends". Do NOT plan parts another robot intends.
-If an important goal is in nobody's "intends" and you can do it, you may take it.
+STEP 2 - YOUR PART. Your part is the work in YOUR room (start from your "intends").
+Objects or help you need from other rooms become requests.
 If nothing important needs you, return an EMPTY "steps" list. An idle robot is fine; invented
 work that the task did not ask for is a mistake.
 
 STEP 3 - STEPS. Every step must serve one of YOUR goals: "serves" is the index of that goal.
 Do high-priority goals first. Use only these step types:
-- LOCAL:    something you do yourself. "uses": index of the can_do entry it relies on.
-            "location": the room where it happens (your own room unless you are mobile).
+- LOCAL:    something you do yourself, in your own room. "uses": index of the can_do entry it relies on.
 - ASK_HELP: another robot must DO something before one of YOUR OWN later LOCAL steps can happen.
             Requires "target", "action", "enables".
 - RECEIVE:  you need an OBJECT for one of YOUR OWN later LOCAL steps.
@@ -81,12 +90,19 @@ Do high-priority goals first. Use only these step types:
 physically impossible before the request is done (e.g. you cannot put the Mug on the table before
 you receive the Mug). Never request parts of the task your own steps do not depend on.
 
+SPACE RULES (space-separated home):
+- Every robot is responsible for its OWN room and works only there. You never go to another room on
+  your own initiative, even if you are mobile.
+- Objects from another room: write RECEIVE to that room's robot. Objects are handed over at the room
+  doors; how they travel is not your concern.
+- Work in your room that your body cannot do (out of reach, too heavy, you are fixed in place): write
+  ASK_HELP to a robot that can, and say exactly what it should do. A mobile robot leaves its room ONLY
+  when it accepts such a request.
+
 OBJECT HANDOFFS (only one way):
 - The robot that NEEDS an object writes RECEIVE. That is all.
 - The robot that HAS the object writes NOTHING about the handoff now: no "come and get it" request,
   no "put it into R3's gripper" step. If someone sends RECEIVE, it will answer later with a PASS.
-- A mobile giver brings the object to the receiver; an immobile giver leaves it at its room's handoff
-  spot and the receiver (if mobile) picks it up. If neither can move, the handoff is impossible.
 
 PHYSICAL RULES (simulator): a robot holds at most ONE object at a time. Write moving an object as
 ONE step with its destination, e.g. "move the Mug from the counter to the CoffeeTable". Fixed
@@ -101,10 +117,10 @@ Return JSON:
  "reasoning": "which goals matter, which part is mine, what I depend on",
  "goals": [{{"goal": "...", "priority": "high"}}, {{"goal": "...", "priority": "low"}}],
  "steps": [
-  {{"type": "RECEIVE", "item": "...", "target": "R1", "location": "kitchen", "enables": 1, "serves": 0, "duration": 1}},
-  {{"type": "LOCAL", "action": "move ... from ... to ...", "uses": 0, "location": "living room", "serves": 0, "duration": 3}},
-  {{"type": "ASK_HELP", "action": "...", "target": "R2", "location": "living room", "enables": 3, "serves": 1, "duration": 5}},
-  {{"type": "LOCAL", "action": "...", "uses": 1, "location": "living room", "serves": 1, "duration": 2}}
+  {{"type": "RECEIVE", "item": "...", "target": "R1", "enables": 1, "serves": 0, "duration": 1}},
+  {{"type": "LOCAL", "action": "move ... from ... to ...", "uses": 0, "serves": 0, "duration": 3}},
+  {{"type": "ASK_HELP", "action": "move the heavy ... to ...", "target": "R2", "enables": 3, "serves": 1, "duration": 5}},
+  {{"type": "LOCAL", "action": "...", "uses": 1, "serves": 1, "duration": 2}}
  ]
 }}"""
 
@@ -147,9 +163,10 @@ If you accept or volunteer, you add ONE step to your own plan:
 - for ASK_HELP you will add a HELP step: give "action" and "uses" (index into your can_do).
   You hold one object at a time; write object moves as "move X from A to B".
 - for RECEIVE you will add a PASS step: give "item", copied exactly from YOUR has_items.
-  If you are mobile, PASS means you bring the item to the requester. If you are not mobile, it means
-  you put it at your room's handoff spot and the requester picks it up.
-  The PASS step includes picking the item up. Do not add other steps for the handoff.
+  PASS means you hand the item over at your room's door; it includes picking it up.
+  Do not add other steps for the handoff.
+- Accepting an ASK_HELP for another room is the ONLY reason to leave your room. Accept only if your
+  body can do it, and only if it does not break your own room's work.
 - "insert_after": the id of the step in your plan after which you do it, or "START".
 - "duration": minutes, one of {durations}.
 
