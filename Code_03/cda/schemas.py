@@ -139,6 +139,7 @@ class Node:
     origin: str = "local"              # local | accept | volunteer
     answers: str | None = None         # provider -> id of the request it answers
     enables: str | None = None         # request -> id of the own later step that needs it
+    serves: str | None = None          # the task goal (from the robot's own goal list) this step serves
     status: str = "active"             # active | dropped | blocked
     violations: list[str] = field(default_factory=list)
     travel: int = 0                    # added by the scheduler
