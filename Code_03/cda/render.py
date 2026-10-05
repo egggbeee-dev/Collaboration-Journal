@@ -37,12 +37,17 @@ def render(g: PlanGraph) -> str:
     lines = [f"### Joint Plan — {g.cfg.task_id}  (makespan {ms} min / deadline {g.cfg.deadline_min} min: {ok})", ""]
     lines += [_line(g, i) for i in act]
     blocked = [n for n in g.nodes.values() if n.status == "blocked"]
+    skipped = [n for n in g.nodes.values() if n.status == "skipped"]
     if g.unresolved:
         lines += ["", "### Unresolved"]
         lines += [f"- {u}" for u in g.unresolved]
     if blocked:
-        lines += ["", "### Blocked (cannot run)"]
-        lines += [f"- {n.agent} [{n.type}] {n.text()} ({n.id})" for n in blocked]
+        lines += ["", "### Blocked (cannot run; the robot skips them and continues)"]
+        lines += [f"- {n.agent} [{n.type}] {n.text()} ({n.id}) — {n.violations[-1] if n.violations else ''}"
+                  for n in blocked]
+    if skipped:
+        lines += ["", "### Skipped (no longer needed)"]
+        lines += [f"- {n.agent} [{n.type}] {n.text()} ({n.id})" for n in skipped]
     if g.warnings:
         lines += ["", "### Warnings"]
         lines += [f"- {w}" for w in g.warnings]
@@ -71,7 +76,8 @@ def metrics(g: PlanGraph, plan_meta: dict, llm_usage: dict) -> dict:
         "confirmed_ratio": round(n_conf / len(final_collab), 3) if final_collab else None,
         "selected_by_graph": n_graph,
         "selected_by_rule_single_volunteer": len(g.selected_by_rule & {e.dst for e in final_collab}),
-        "capability_violations_after_fix": sum(bool(n.violations) for n in nodes if n.type not in REQUEST_TYPES),
+        "capability_violations_after_fix": sum(1 for n in nodes if n.type not in REQUEST_TYPES and
+                                               any(not v.startswith("blocked (") for v in n.violations)),
         "n_requests_withdrawn": sum(1 for d in g.drops if d["by"] == "stage2-check"),
         "n_served_by_own_existing_step": sum(1 for e in final_collab if g.nodes[e.src].type == "LOCAL"),
         "n_duplicates_merged": g.n_merged,
@@ -86,5 +92,12 @@ def metrics(g: PlanGraph, plan_meta: dict, llm_usage: dict) -> dict:
         "deadline": g.cfg.deadline_min,
         "deadline_ok": g.makespan() <= g.cfg.deadline_min,
         "success_no_blocked": all(n.status != "blocked" for n in nodes),
+        "n_requests_declined": sum(v == "declined" for v in g.request_outcome.values()),
+        "n_requests_failed": sum(v == "failed" for v in g.request_outcome.values()),
+        "n_requests_moot": sum(v == "moot" for v in g.request_outcome.values()),
+        "n_blocked_by_decline": sum(1 for n in nodes if n.status == "blocked" and "blocked (declined)" in n.violations),
+        "n_blocked_by_failure": sum(1 for n in nodes if n.status == "blocked" and "blocked (failed)" in n.violations),
+        "success_no_failure": not any(n.status == "blocked" and "blocked (failed)" in n.violations for n in nodes),
+        "n_handoff_prep_dropped": g.n_prep_dropped,
         **llm_usage,
     }
