@@ -20,16 +20,19 @@ Write an OFFER: what YOU can contribute to THIS task, which part YOU intend to t
 Think in this order and write it in "reasoning":
  1. GOAL STATE: when this task is done, what must be true in the house?
  2. PRIORITY: which of those matter most (the task's stated priorities, the people it is for, the deadline)?
- 3. MY CONTRIBUTION: which of the important ones happen in MY room, and which objects in my room
-    will other rooms need?
+ 3. MY CONTRIBUTION: which of the important ones happen in MY room?
+ 4. MY OBJECTS: which objects in my room could help the task in another room (e.g. where the task
+    mainly happens)? You cannot bring them yourself, but you can suggest them.
 Only then fill the fields.
 
 - "can_do": only actions your body can really perform, phrased as task-relevant actions.
-- "has_items": EVERY task-relevant movable object you can see in your room, even if you would move it
-  yourself, so that others know where things are.
+- "has_items": EVERY movable object you can see in your room. Do NOT filter by relevance: other robots
+  decide what they need. This list is the only way they learn what exists in your room.
+- "suggests": objects from your room that could help the task, each with what it would be used for
+  (e.g. "Towel: wiping sweat after the workout"). The robot that needs it decides whether to RECEIVE it.
 - "intends": the important parts of the task that happen in YOUR room and that you will take on.
-  If nothing important happens in your room, leave it EMPTY: doing nothing is better than inventing
-  work that is not part of the task. (Others may still ask you for objects or help.)
+  It may be EMPTY if nothing important happens in your room; doing nothing is better than inventing
+  work that is not part of the task. Even then, always fill "has_items" and "suggests".
 
 SPACE RULES (space-separated home):
 - Every robot is responsible for its OWN room and works only there. You never go to another room on
@@ -42,11 +45,12 @@ SPACE RULES (space-separated home):
 
 Return JSON:
 {{
- "reasoning": "1. goal state ... 2. priority ... 3. my contribution ...",
+ "reasoning": "1. goal state ... 2. priority ... 3. my contribution ... 4. my objects ...",
  "capability": "one sentence about your embodiment",
  "can_do": ["concrete action you can perform", ...],
  "cannot_do": ["task-relevant action you cannot perform, and why", ...],
- "has_items": ["task-relevant movable object visible in your room", ...],
+ "has_items": ["every movable object visible in your room", ...],
+ "suggests": ["Object: what it could be used for in this task", ...],
  "intends": ["important part of the task you will do", ...],
  "need_from_others": ["what you will need from other robots to do your intended part", ...],
  "obs_scope": "what you can and cannot observe"
@@ -75,11 +79,16 @@ STEP 1 - GOALS. Write "goals": what must be true when the task is done, each wit
 (high / medium / low) taken from the task itself. Only goals of the TASK, not general housekeeping.
 
 STEP 2 - YOUR PART. Your part is the work in YOUR room (start from your "intends").
-Objects or help you need from other rooms become requests.
-If nothing important needs you, return an EMPTY "steps" list. An idle robot is fine; invented
-work that the task did not ask for is a mistake.
 
-STEP 3 - STEPS. Every step must serve one of YOUR goals: "serves" is the index of that goal.
+STEP 3 - NEEDS FROM OTHER ROOMS. What does the task need in YOUR room that is NOT in your room?
+Look at the other robots' "has_items" and "suggests". For each object you will actually use, write a
+RECEIVE followed by your own LOCAL step that uses it (e.g. RECEIVE Towel, then "move the Towel to the
+edge of the workout area"). Do not ignore useful suggestions just because you can finish without them.
+
+If nothing important needs you in your room and you need nothing, return an EMPTY "steps" list.
+An idle robot is fine; invented work that the task did not ask for is a mistake.
+
+STEP 4 - STEPS. Every step must serve one of YOUR goals: "serves" is the index of that goal.
 Do high-priority goals first. Use only these step types:
 - LOCAL:    something you do yourself, in your own room. "uses": index of the can_do entry it relies on.
 - ASK_HELP: another robot must DO something before one of YOUR OWN later LOCAL steps can happen.
