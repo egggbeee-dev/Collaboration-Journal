@@ -1,0 +1,62 @@
+{
+ "offer:R1": {"reasoning": "Tub faucet is above my reach; I am docked in the bathroom.",
+   "capability": "docked wheeled base in the bathroom, one short arm (reach 0.8 m)",
+   "can_do": ["wipe the bathroom floor", "place bath toys in the tub", "open or close the low bathroom window latch", "pick up objects left at the bathroom door"],
+   "cannot_do": ["turn the bathtub faucet (too high)", "leave the bathroom"],
+   "has_items": ["bath toys"],
+   "need_from_others": ["fill the tub with warm water", "clean towel", "child pajamas"],
+   "obs_scope": "bathroom only"},
+ "offer:R2": {"reasoning": "Clean laundry is here.", "capability": "fixed arm above the laundry table",
+   "can_do": ["fold laundry", "place items at the laundry room door"],
+   "cannot_do": ["leave the laundry room"], "has_items": ["clean towel", "child pajamas"],
+   "need_from_others": [], "obs_scope": "laundry room only"},
+ "offer:R3": {"reasoning": "I can walk anywhere.", "capability": "humanoid, two arms, mobile",
+   "can_do": ["turn faucets and adjust water temperature", "open and close windows and doors", "carry objects up to 10 kg between rooms"],
+   "cannot_do": [], "has_items": ["spare towel"], "need_from_others": [], "obs_scope": "hallway and doors"},
+ "offer:R4": {"reasoning": "Thermostat shows the bathroom is cold.", "capability": "fixed arm next to the stove",
+   "can_do": ["heat water in the kettle", "read the thermostat display"],
+   "cannot_do": ["leave the kitchen"], "has_items": ["bath thermometer"],
+   "need_from_others": ["someone to close the bathroom window"], "obs_scope": "kitchen and thermostat"},
+
+ "plan:R1": {"reasoning": "...", "steps": [
+   {"type": "LOCAL", "action": "wipe the bathroom floor", "uses": 0, "location": "bathroom", "duration": 3},
+   {"type": "ASK_HELP", "action": "fill the tub with warm water", "target": "R3", "location": "bathroom", "duration": 10},
+   {"type": "RECEIVE", "item": "clean towel", "target": "R2", "location": "bathroom", "duration": 1},
+   {"type": "RECEIVE", "item": "child pajamas", "target": "R4", "location": "bathroom", "duration": 1},
+   {"type": "LOCAL", "action": "place bath toys in the tub", "uses": 1, "location": "bathroom", "duration": 2}]},
+ "plan:R1:fix": {"reasoning": "Pajamas are listed by R2, not R4.", "steps": [
+   {"type": "LOCAL", "action": "wipe the bathroom floor", "uses": 0, "location": "bathroom", "duration": 3},
+   {"type": "ASK_HELP", "action": "fill the tub with warm water", "target": "R3", "location": "bathroom", "duration": 10},
+   {"type": "RECEIVE", "item": "clean towel", "target": "R2", "location": "bathroom", "duration": 1},
+   {"type": "RECEIVE", "item": "child pajamas", "target": "R2", "location": "bathroom", "duration": 1},
+   {"type": "LOCAL", "action": "place bath toys in the tub", "uses": 1, "location": "bathroom", "duration": 2}]},
+ "plan:R2": {"reasoning": "...", "steps": [
+   {"type": "LOCAL", "action": "fold the clean laundry", "uses": 0, "location": "laundry room", "duration": 3}]},
+ "plan:R3": {"reasoning": "...", "steps": [
+   {"type": "LOCAL", "action": "open the hallway door to the bathroom", "uses": 1, "location": "hallway", "duration": 1}]},
+ "plan:R4": {"reasoning": "...", "steps": [
+   {"type": "LOCAL", "action": "read the thermostat display", "uses": 1, "location": "kitchen", "duration": 1},
+   {"type": "ASK_HELP", "action": "close the bathroom window", "target": "R2", "location": "bathroom", "duration": 1}]},
+
+ "propose:R1": {"judgments": [
+   {"request": "r4_s2", "decision": "volunteer", "reason": "I am in the bathroom and can reach the low window latch",
+    "action": "close the bathroom window latch", "uses": 2, "insert_after": "r1_s1", "duration": 1}]},
+ "propose:R2": {"judgments": [
+   {"request": "r1_s2", "decision": "ignore"},
+   {"request": "r1_s3", "decision": "accept", "reason": "I have a clean towel", "item": "clean towel", "insert_after": "r2_s1", "duration": 1},
+   {"request": "r1_s4", "decision": "accept", "reason": "I have the pajamas", "item": "child pajamas", "insert_after": "r2_s1", "duration": 1},
+   {"request": "r4_s2", "decision": "reject", "reason": "I cannot leave the laundry room"}]},
+ "propose:R3": {"judgments": [
+   {"request": "r1_s2", "decision": "accept", "reason": "I can turn faucets", "action": "fill the tub with warm water at 40C",
+    "uses": 0, "insert_after": "r3_s1", "duration": 10},
+   {"request": "r1_s3", "decision": "volunteer", "reason": "I have a spare towel", "item": "spare towel", "insert_after": "START", "duration": 1},
+   {"request": "r1_s4", "decision": "ignore"},
+   {"request": "r4_s2", "decision": "volunteer", "reason": "I can close windows", "action": "close the bathroom window",
+    "uses": 1, "insert_after": "START", "duration": 1}]},
+ "propose:R4": {"judgments": [
+   {"request": "r1_s2", "decision": "volunteer", "reason": "I can heat water", "action": "heat water for the tub",
+    "uses": 0, "insert_after": "r4_s1", "duration": 5}]},
+
+ "graph:1": {"ops": [
+   {"op": "connect", "src": "r1_s6", "dst": "r4_s2", "why": "R1 is already in the bathroom and can reach the low latch; no travel needed"}]}
+}
