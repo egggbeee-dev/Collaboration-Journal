@@ -102,5 +102,6 @@ def metrics(g: PlanGraph, plan_meta: dict, llm_usage: dict) -> dict:
         "n_offers_made": sum(1 for n in nodes if n.type == "PASS" and n.origin == "offer"),
         "n_offers_taken": sum(1 for e in final_collab if g.nodes[e.src].origin == "offer"),
         "n_offers_untaken": g.n_offers_untaken,
+        "n_preparations_released": g.n_prep_released,
         **llm_usage,
     }
