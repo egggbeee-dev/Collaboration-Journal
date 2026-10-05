@@ -36,19 +36,23 @@ def _plan_view(nodes: list[Node]) -> list[dict]:
 
 
 async def _judge(cfg: TaskConfig, agent: str, plans: dict[str, list[Node]], offers: dict[str, Offer],
-                 requests: list[Node], llm: BaseLLM, log: EventLog) -> list[dict]:
+                 requests: list[Node], passes: list[Node], llm: BaseLLM, log: EventLog
+                 ) -> tuple[list[dict], list[dict]]:
     visible = [r for r in requests if r.agent != agent]
-    if not visible:
+    to_me = [p for p in passes if p.target == agent]
+    if not visible and not to_me:
         log.log("propose", agent, "skip_no_requests")
-        return []
+        return [], []
     user = PROPOSE_USER.format(task=cfg.task, own_offer=_j(offers[agent].to_dict()),
                                can_do_indexed=indexed(offers[agent].can_do),
                                own_plan=_j(_plan_view(plans[agent])),
-                               requests=_j([r.brief() | {"location": r.location} for r in visible]))
+                               requests=_j([r.brief() | {"location": r.location} for r in visible]) if visible
+                               else "(none)",
+                               offers=_j([p.brief() | {"for": p.serves} for p in to_me]) if to_me else "(none)")
     d = await llm.complete(propose_system(agent), user, key=f"propose:{agent}")
-    js = d.get("judgments", []) or []
-    log.log("propose", agent, "judged", n=len(js))
-    return js
+    js, os_ = d.get("judgments", []) or [], d.get("offers", []) or []
+    log.log("propose", agent, "judged", n=len(js), offers=len(os_))
+    return js, os_
 
 
 def _insert(order: list[Node], node: Node, after: str | None) -> None:
@@ -66,15 +70,22 @@ async def edge_proposal(cfg: TaskConfig, plans: dict[str, list[Node]], offers: d
                         llm: BaseLLM, log: EventLog) -> tuple[list[Edge], list[dict]]:
     """Mutates `plans` (inserts provider steps). Returns collaboration edges and a judgment record."""
     requests = [n for a in cfg.ids for n in plans[a] if n.type in REQUEST_TYPES and n.status == "active"]
+    passes = [n for a in cfg.ids for n in plans[a] if n.type == PASS and n.origin == "offer" and n.status == "active"]
     by_id = {r.id: r for r in requests}
-    raw = await asyncio.gather(*[_judge(cfg, a, plans, offers, requests, llm, log) for a in cfg.ids])
+    by_pass = {p.id: p for p in passes}
+    raw = await asyncio.gather(*[_judge(cfg, a, plans, offers, requests, passes, llm, log) for a in cfg.ids])
 
     edges: list[Edge] = []
     record: list[dict] = []
     counters = {a: max([int(n.id.split("_s")[1]) for n in plans[a]] or [0]) for a in cfg.ids}
     stock = {a: Counter(norm(x) for x in offers[a].has_items) for a in cfg.ids}
+    for p in passes:                                   # offered items are already promised
+        stock[p.agent][norm(p.item)] -= 1
 
-    for agent, judgments in zip(cfg.ids, raw):
+    def linked(pid: str) -> bool:
+        return any(e.src == pid for e in edges)
+
+    for agent, (judgments, _) in zip(cfg.ids, raw):
         me = cfg.agent(agent)
         seen: set[str] = set()
         # accepts first, so promised items go to the robot that asked us directly
@@ -137,6 +148,16 @@ async def edge_proposal(cfg: TaskConfig, plans: dict[str, list[Node]], offers: d
                 location = req.location
             else:
                 item = str(j.get("item") or req.item or "")
+                mine = next((p for p in passes if p.agent == agent and p.target == req.agent
+                             and norm(p.item) == norm(item) and not linked(p.id)), None)
+                if mine is not None:                  # I already offered exactly this: link, no copy
+                    status = CONFIRMED if dec == "accept" else PROPOSED
+                    edges.append(Edge(mine.id, rid, TRANSFER, status, "stage3"))
+                    mine.answers = rid
+                    rec.update(result=status, provider=mine.id, linked_offer=True)
+                    record.append(rec)
+                    log.log("propose", agent, "linked_own_offer", request=rid, provider=mine.id)
+                    continue
                 if stock[agent][norm(item)] <= 0:
                     problem = f"item '{item}' not available (not in has_items or already promised)"
                 action = action or f"pass {item} to {req.agent}"
@@ -160,4 +181,49 @@ async def edge_proposal(cfg: TaskConfig, plans: dict[str, list[Node]], offers: d
             rec.update(result=status, provider=node.id)
             record.append(rec)
             log.log("propose", agent, f"{dec}", request=rid, provider=node.id, edge=status)
+
+    # ---- offers: the receiver decides. Receiving adds a RECEIVE (born linked to the PASS by id)
+    # and the receiver's own LOCAL step that uses the object.
+    for agent, (_, offer_js) in zip(cfg.ids, raw):
+        for oj in offer_js:
+            oid = str(oj.get("offer", ""))
+            p = by_pass.get(oid)
+            dec = str(oj.get("decision", "decline")).lower()
+            rec = {"agent": agent, "offer": oid, "decision": dec, "reason": oj.get("reason", "")}
+            if p is None or p.target != agent:
+                rec["result"] = "invalid_offer_id"
+                record.append(rec)
+                continue
+            if dec not in ("receive", "accept"):
+                rec["result"] = "decline"
+                record.append(rec)
+                log.log("propose", agent, "offer_declined", offer=oid)
+                continue
+            if linked(oid):
+                rec["result"] = "already_linked (you requested it)"
+                record.append(rec)
+                continue
+            uses = oj.get("uses")
+            if not isinstance(uses, int) or not (0 <= uses < len(offers[agent].can_do)):
+                rec["result"] = f"rejected_by_check: uses={uses} is not a valid can_do index"
+                record.append(rec)
+                log.log("propose", agent, "answer_rejected_by_check", offer=oid)
+                continue
+            n_ = agent_num(agent)
+            counters[agent] += 1
+            use = Node(id=f"r{n_}_s{counters[agent] + 1}", agent=agent, type="LOCAL",
+                       action=str(oj.get("action") or f"use the {p.item}"), uses=uses,
+                       location=cfg.agent(agent).profile.room, duration=snap_duration(oj.get("duration", 1)),
+                       origin="accept", serves=f"offered {p.item}")
+            rcv = Node(id=f"r{n_}_s{counters[agent]}", agent=agent, type="RECEIVE", item=p.item,
+                       action=f"receive {p.item}", target=p.agent, location=cfg.agent(agent).profile.room,
+                       duration=1, origin="accept", enables=use.id, serves=f"offered {p.item}")
+            counters[agent] += 1
+            _insert(plans[agent], rcv, oj.get("insert_after"))
+            plans[agent].insert(plans[agent].index(rcv) + 1, use)
+            p.answers = rcv.id
+            edges.append(Edge(oid, rcv.id, TRANSFER, CONFIRMED, "stage3"))
+            rec.update(result=CONFIRMED, provider=oid, receive=rcv.id, use=use.id)
+            record.append(rec)
+            log.log("propose", agent, "offer_received", offer=oid, receive=rcv.id, use=use.id)
     return edges, record
