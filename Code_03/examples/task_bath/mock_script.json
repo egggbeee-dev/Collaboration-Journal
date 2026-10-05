@@ -1,0 +1,370 @@
+{
+ "offer:R1": {
+  "reasoning": "Docked in the bathroom; the faucet is above my reach.",
+  "capability": "docked wheeled base in the bathroom, one short arm (reach 0.8 m)",
+  "can_do": [
+   "wipe the bathroom floor",
+   "place bath toys in the tub",
+   "open or close the low bathroom window latch",
+   "pick up objects left at the bathroom door"
+  ],
+  "cannot_do": [
+   "turn the bathtub faucet (too high)",
+   "leave the bathroom"
+  ],
+  "has_items": [
+   "bath toys"
+  ],
+  "intends": [
+   "clean the bathroom floor",
+   "put bath toys in the tub",
+   "set out the towel and pajamas by the tub"
+  ],
+  "need_from_others": [
+   "warm water in the tub",
+   "clean towel and pajamas brought to the bathroom"
+  ],
+  "obs_scope": "bathroom only"
+ },
+ "offer:R2": {
+  "reasoning": "Clean laundry is here and I can drive.",
+  "capability": "wheeled laundry robot with one arm",
+  "can_do": [
+   "fold laundry",
+   "carry laundry between rooms"
+  ],
+  "cannot_do": [
+   "operate faucets"
+  ],
+  "has_items": [
+   "clean towel",
+   "child pajamas"
+  ],
+  "intends": [
+   "prepare a clean towel and pajamas"
+  ],
+  "need_from_others": [],
+  "obs_scope": "laundry room only"
+ },
+ "offer:R3": {
+  "reasoning": "I can walk anywhere and use faucets.",
+  "capability": "humanoid, two arms, mobile",
+  "can_do": [
+   "turn faucets and adjust water temperature",
+   "open and close windows and doors",
+   "carry objects up to 10 kg between rooms",
+   "measure water temperature with a thermometer"
+  ],
+  "cannot_do": [],
+  "has_items": [
+   "spare towel"
+  ],
+  "intends": [
+   "fill the tub with warm water"
+  ],
+  "need_from_others": [
+   "a bath thermometer"
+  ],
+  "obs_scope": "hallway and doors"
+ },
+ "offer:R4": {
+  "reasoning": "The thermostat shows the bathroom is cold.",
+  "capability": "fixed arm next to the stove",
+  "can_do": [
+   "heat water in the kettle",
+   "read the thermostat display",
+   "place items on the kitchen counter for pickup"
+  ],
+  "cannot_do": [
+   "leave the kitchen"
+  ],
+  "has_items": [
+   "bath thermometer"
+  ],
+  "intends": [
+   "monitor the bathroom temperature"
+  ],
+  "need_from_others": [
+   "someone to close the bathroom window"
+  ],
+  "obs_scope": "kitchen and thermostat"
+ },
+ "plan:R1": {
+  "reasoning": "first draft",
+  "steps": [
+   {
+    "type": "LOCAL",
+    "action": "wipe the bathroom floor",
+    "uses": 0,
+    "location": "bathroom",
+    "duration": 3
+   },
+   {
+    "type": "ASK_HELP",
+    "action": "fill the tub with warm water",
+    "target": "R3",
+    "location": "bathroom",
+    "duration": 10
+   },
+   {
+    "type": "ASK_HELP",
+    "action": "heat water in the kettle",
+    "target": "R4",
+    "location": "kitchen",
+    "duration": 5
+   },
+   {
+    "type": "ASK_HELP",
+    "action": "bring a clean towel and the child pajamas to the bathroom door",
+    "target": "R2",
+    "location": "bathroom",
+    "enables": 5,
+    "duration": 2
+   },
+   {
+    "type": "LOCAL",
+    "action": "place bath toys in the tub",
+    "uses": 1,
+    "location": "bathroom",
+    "duration": 2
+   },
+   {
+    "type": "LOCAL",
+    "action": "set the towel and pajamas next to the tub",
+    "uses": 3,
+    "location": "bathroom",
+    "duration": 1
+   }
+  ]
+ },
+ "plan:R1:fix": {
+  "reasoning": "The kettle is not needed by my own steps; R3 fills the tub.",
+  "steps": [
+   {
+    "type": "LOCAL",
+    "action": "wipe the bathroom floor",
+    "uses": 0,
+    "location": "bathroom",
+    "duration": 3
+   },
+   {
+    "type": "ASK_HELP",
+    "action": "fill the tub with warm water",
+    "target": "R3",
+    "location": "bathroom",
+    "enables": 3,
+    "duration": 10
+   },
+   {
+    "type": "ASK_HELP",
+    "action": "bring a clean towel and the child pajamas to the bathroom door",
+    "target": "R2",
+    "location": "bathroom",
+    "enables": 4,
+    "duration": 2
+   },
+   {
+    "type": "LOCAL",
+    "action": "place bath toys in the tub",
+    "uses": 1,
+    "location": "bathroom",
+    "duration": 2
+   },
+   {
+    "type": "LOCAL",
+    "action": "set the towel and pajamas next to the tub",
+    "uses": 3,
+    "location": "bathroom",
+    "duration": 1
+   }
+  ]
+ },
+ "plan:R2": {
+  "reasoning": "...",
+  "steps": [
+   {
+    "type": "LOCAL",
+    "action": "fold the clean laundry",
+    "uses": 0,
+    "location": "laundry room",
+    "duration": 3
+   },
+   {
+    "type": "ASK_HELP",
+    "action": "open the hallway door to the bathroom",
+    "target": "R3",
+    "location": "hallway",
+    "enables": 2,
+    "duration": 1
+   },
+   {
+    "type": "LOCAL",
+    "action": "put the folded laundry in the bathroom cabinet",
+    "uses": 1,
+    "location": "bathroom",
+    "duration": 2
+   }
+  ]
+ },
+ "plan:R3": {
+  "reasoning": "...",
+  "steps": [
+   {
+    "type": "LOCAL",
+    "action": "open the hallway door to the bathroom",
+    "uses": 1,
+    "location": "hallway",
+    "duration": 1
+   },
+   {
+    "type": "RECEIVE",
+    "item": "bath thermometer",
+    "target": "R4",
+    "location": "kitchen",
+    "enables": 3,
+    "duration": 1
+   },
+   {
+    "type": "LOCAL",
+    "action": "fill the tub with warm water",
+    "uses": 0,
+    "location": "bathroom",
+    "duration": 10
+   },
+   {
+    "type": "LOCAL",
+    "action": "check the water temperature with the thermometer",
+    "uses": 3,
+    "location": "bathroom",
+    "duration": 1
+   }
+  ]
+ },
+ "plan:R4": {
+  "reasoning": "...",
+  "steps": [
+   {
+    "type": "LOCAL",
+    "action": "read the thermostat display",
+    "uses": 1,
+    "location": "kitchen",
+    "duration": 1
+   },
+   {
+    "type": "ASK_HELP",
+    "action": "close the bathroom window",
+    "target": "R2",
+    "location": "bathroom",
+    "enables": 2,
+    "duration": 1
+   },
+   {
+    "type": "LOCAL",
+    "action": "check that the bathroom temperature rises on the thermostat",
+    "uses": 1,
+    "location": "kitchen",
+    "duration": 1
+   }
+  ]
+ },
+ "propose:R1": {
+  "judgments": [
+   {
+    "request": "r4_s2",
+    "decision": "volunteer",
+    "reason": "I am in the bathroom and can reach the low window latch",
+    "action": "close the bathroom window latch",
+    "uses": 2,
+    "insert_after": "r1_s1",
+    "duration": 1
+   }
+  ]
+ },
+ "propose:R2": {
+  "judgments": [
+   {
+    "request": "r1_s2",
+    "decision": "ignore"
+   },
+   {
+    "request": "r1_s3",
+    "decision": "accept",
+    "reason": "I have both and can drive there",
+    "action": "bring a clean towel and the child pajamas to the bathroom door",
+    "uses": 1,
+    "insert_after": "r2_s1",
+    "duration": 2
+   },
+   {
+    "request": "r4_s2",
+    "decision": "reject",
+    "reason": "busy with laundry; no window skill"
+   }
+  ]
+ },
+ "propose:R3": {
+  "judgments": [
+   {
+    "request": "r1_s2",
+    "decision": "accept",
+    "reason": "I can turn faucets",
+    "action": "fill the tub with warm water",
+    "uses": 0,
+    "insert_after": "r3_s3",
+    "duration": 10
+   },
+   {
+    "request": "r2_s2",
+    "decision": "already_doing",
+    "covered_by": "r3_s1",
+    "reason": "my first step opens that door"
+   },
+   {
+    "request": "r4_s2",
+    "decision": "volunteer",
+    "reason": "I can close windows",
+    "action": "close the bathroom window",
+    "uses": 1,
+    "insert_after": "START",
+    "duration": 1
+   }
+  ]
+ },
+ "propose:R4": {
+  "judgments": [
+   {
+    "request": "r3_s2",
+    "decision": "accept",
+    "reason": "I have it",
+    "item": "bath thermometer",
+    "insert_after": "START",
+    "duration": 1
+   },
+   {
+    "request": "r1_s2",
+    "decision": "volunteer",
+    "reason": "I can heat water",
+    "action": "heat water for the tub",
+    "uses": 0,
+    "insert_after": "r4_s1",
+    "duration": 5
+   }
+  ]
+ },
+ "graph:1": {
+  "ops": [
+   {
+    "op": "connect",
+    "src": "r1_s6",
+    "dst": "r4_s2",
+    "why": "R1 is already in the bathroom and reaches the low latch; no travel"
+   },
+   {
+    "op": "merge",
+    "node": "r3_s5",
+    "into": "r3_s3",
+    "why": "R3 already fills the tub in its own step"
+   }
+  ]
+ }
+}
