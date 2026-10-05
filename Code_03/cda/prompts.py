@@ -108,10 +108,12 @@ SPACE RULES (space-separated home):
   ASK_HELP to a robot that can, and say exactly what it should do. A mobile robot leaves its room ONLY
   when it accepts such a request.
 
-OBJECT HANDOFFS (only one way):
-- The robot that NEEDS an object writes RECEIVE. That is all.
-- The robot that HAS the object writes NOTHING about the handoff now: no "come and get it" request,
-  no "put it into R3's gripper" step. If someone sends RECEIVE, it will answer later with a PASS.
+OBJECT HANDOFFS (two ways, both decided by the other side):
+- You NEED an object from another room: write RECEIVE (+ "enables": your step that uses it).
+- You HAVE an object that another room's work needs: write PASS with "target" (that robot) and
+  "item" (copied from YOUR has_items). This is an OFFER; the target decides whether to take it.
+  PASS already includes picking the object up and handing it over at your door. Never write steps
+  like "put it on the counter for collection" or "leave it by the door": write the PASS instead.
 
 PHYSICAL RULES (simulator): a robot holds at most ONE object at a time. Write moving an object as
 ONE step with its destination, e.g. "move the Mug from the counter to the CoffeeTable". Fixed
@@ -129,7 +131,8 @@ Return JSON:
   {{"type": "RECEIVE", "item": "...", "target": "R1", "enables": 1, "serves": 0, "duration": 1}},
   {{"type": "LOCAL", "action": "move ... from ... to ...", "uses": 0, "serves": 0, "duration": 3}},
   {{"type": "ASK_HELP", "action": "move the heavy ... to ...", "target": "R2", "enables": 3, "serves": 1, "duration": 5}},
-  {{"type": "LOCAL", "action": "...", "uses": 1, "serves": 1, "duration": 2}}
+  {{"type": "LOCAL", "action": "...", "uses": 1, "serves": 1, "duration": 2}},
+  {{"type": "PASS", "item": "...", "target": "R2", "serves": 1, "duration": 1}}
  ]
 }}"""
 
@@ -155,7 +158,8 @@ Fix ONLY these problems and return the full corrected JSON in the same format.""
 
 # ================================================================ Stage 3: Edge Proposal
 PROPOSE_SYSTEM = """You are robot {agent}. Other robots have published requests.
-Judge each request yourself, using everything you know (including your private observations).
+Judge each request, and each object offered to you, using everything you know (including your
+private observations).
 
 FIRST check your own plan: if one of your existing steps already does what an ASK_HELP asks for,
 answer "already_doing" with "covered_by": that step id. Do NOT add a second copy of work you
@@ -172,6 +176,8 @@ If you accept or volunteer, you add ONE step to your own plan:
 - for ASK_HELP you will add a HELP step: give "action" and "uses" (index into your can_do).
   You hold one object at a time; write object moves as "move X from A to B".
 - for RECEIVE you will add a PASS step: give "item", copied exactly from YOUR has_items.
+  If you already OFFERED exactly this item to this robot (a PASS in your plan), just "accept":
+  your offer is linked, no second PASS is added.
   PASS means you hand the item over at your room's door; it includes picking it up.
   Do not add other steps for the handoff.
 - Accepting an ASK_HELP for another room is the ONLY reason to leave your room. Accept only if your
@@ -179,8 +185,17 @@ If you accept or volunteer, you add ONE step to your own plan:
 - "insert_after": the id of the step in your plan after which you do it, or "START".
 - "duration": minutes, one of {durations}.
 
+OFFERS TO YOU: other robots offer objects (PASS). For each: "receive" if you will really use it for
+the task in your room (say what you will do with it), otherwise "decline". Receiving adds to your plan
+a RECEIVE and ONE step of yours that uses the object ("action", "uses", "duration", "insert_after").
+
 Return JSON:
 {{
+ "offers": [
+  {{"offer": "r1_s3", "decision": "receive", "action": "move the Mug to the CoffeeTable", "uses": 0,
+    "insert_after": "r2_s4", "duration": 1}},
+  {{"offer": "r4_s2", "decision": "decline", "reason": "..."}}
+ ],
  "judgments": [
   {{"request": "r4_s2", "decision": "already_doing", "covered_by": "r2_s1", "reason": "..."}},
   {{"request": "r1_s2", "decision": "accept", "reason": "...", "action": "...", "uses": 2,
@@ -203,7 +218,10 @@ YOUR CURRENT PLAN (ids you can use for insert_after):
 {own_plan}
 
 REQUESTS FROM OTHER ROBOTS:
-{requests}"""
+{requests}
+
+OFFERS TO YOU:
+{offers}"""
 
 
 # ================================================================ Stage 4: Graph Reasoning
