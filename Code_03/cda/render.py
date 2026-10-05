@@ -16,7 +16,7 @@ def _line(g: PlanGraph, nid: str) -> str:
     elif n.type == HELP:
         body = f"{n.action} (help {n.target})" + (f" [+{n.travel}m travel to {n.location}]" if n.travel else "")
     elif n.type == PASS:
-        body = f"pass {n.item} to {n.target}"
+        body = f"pass {n.item} to {n.target}" + (" (offered)" if n.origin == "offer" else "")
     else:
         body = n.action
         serves = [g.nodes[e.dst].agent for e in g.collab_edges() if e.src == nid]
@@ -99,5 +99,8 @@ def metrics(g: PlanGraph, plan_meta: dict, llm_usage: dict) -> dict:
         "n_blocked_by_failure": sum(1 for n in nodes if n.status == "blocked" and "blocked (failed)" in n.violations),
         "success_no_failure": not any(n.status == "blocked" and "blocked (failed)" in n.violations for n in nodes),
         "n_handoff_prep_dropped": g.n_prep_dropped,
+        "n_offers_made": sum(1 for n in nodes if n.type == "PASS" and n.origin == "offer"),
+        "n_offers_taken": sum(1 for e in final_collab if g.nodes[e.src].origin == "offer"),
+        "n_offers_untaken": g.n_offers_untaken,
         **llm_usage,
     }
