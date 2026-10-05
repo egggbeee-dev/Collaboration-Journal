@@ -69,6 +69,7 @@ class PlanGraph:
         self.n_tightened = 0
         self.n_prep_dropped = 0
         self.n_offers_untaken = 0
+        self.n_prep_released = 0
         self.request_outcome: dict[str, str] = {}        # request id -> declined | failed | moot
         self._initial_nodes = set(self.nodes)
         self._agreements = {(self.nodes[e.src].agent, e.dst) for e in collab if e.status == CONFIRMED}
@@ -183,6 +184,21 @@ class PlanGraph:
         self.n_merged += 1
         return None
 
+    def _release_prep(self, p: Node, reason: str) -> None:
+        prep = self.nodes.get(p.prepared_by) if p.prepared_by else None
+        if prep is not None and prep.status == "active" and self.drop(prep.id, reason, "rule") is None:
+            self.n_prep_released += 1
+
+    def _pass_after_prep(self) -> None:
+        """An offered PASS can only happen after the step that prepared its object."""
+        for p in self.nodes.values():
+            if p.type != PASS or not p.prepared_by or not self.active(p.id) or not self.active(p.prepared_by):
+                continue
+            ids = self.order[p.agent]
+            if ids.index(p.id) < ids.index(p.prepared_by):
+                ids.remove(p.id)
+                ids.insert(ids.index(p.prepared_by) + 1, p.id)
+
     # ------------------------------------------------------------ 4b: rule layer
     def apply_rules(self) -> None:
         """Deterministic cleanup that needs no judgment."""
@@ -191,6 +207,7 @@ class PlanGraph:
                     not any(e.src == n.id for e in self.collab.values()):
                 if self.drop(n.id, f"offer not taken by {n.target}", "rule") is None:
                     self.n_offers_untaken += 1
+                    self._release_prep(n, f"prepared only for {n.id}, an offer {n.target} did not take")
             if n.status == "active" and n.type == LOCAL and n.violations:
                 self.drop(n.id, "capability check failed: " + "; ".join(n.violations), "rule")
         for rid, r in self.nodes.items():
@@ -347,6 +364,7 @@ class PlanGraph:
                 self.warnings.append({"issue": "possible DUPLICATE_WORK left", "nodes": [n["id"] for n in iss["nodes"]],
                                       "similarity": iss["similarity"]})
         self._drop_unrequested_handoff_prep()
+        self._pass_after_prep()
         g = self.nx()
         roots: list[tuple[str, str]] = []             # (node id, cause)
         for rid, r in self.nodes.items():
@@ -395,6 +413,8 @@ class PlanGraph:
                     p = self.nodes[e.src]
                     if not any(self.active(x.dst) for x in self.collab.values() if x.src == p.id):
                         p.status = "skipped"
+                        if p.type == PASS:
+                            self._release_prep(p, f"prepared only for {p.id}, which is no longer needed")
                         self.drops.append({"node": p.id, "agent": p.agent, "type": p.type, "text": p.text(),
                                            "reason": f"not needed: {r.id} is moot ({nid} cannot run)",
                                            "by": "rule"})
