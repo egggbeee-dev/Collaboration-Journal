@@ -114,6 +114,9 @@ OBJECT HANDOFFS (two ways, both decided by the other side):
   "item" (copied from YOUR has_items). This is an OFFER; the target decides whether to take it.
   PASS already includes picking the object up and handing it over at your door. Never write steps
   like "put it on the counter for collection" or "leave it by the door": write the PASS instead.
+- If you PREPARE an object for another room (e.g. fill a glass with water), you MUST follow it with a
+  PASS of that object, with "prepared_by": the index of the preparing step. If the other robot does
+  not take it, the preparation is cancelled too. If you would not pass it, do not prepare it.
 
 PHYSICAL RULES (simulator): a robot holds at most ONE object at a time. Write moving an object as
 ONE step with its destination, e.g. "move the Mug from the counter to the CoffeeTable". Fixed
@@ -132,7 +135,8 @@ Return JSON:
   {{"type": "LOCAL", "action": "move ... from ... to ...", "uses": 0, "serves": 0, "duration": 3}},
   {{"type": "ASK_HELP", "action": "move the heavy ... to ...", "target": "R2", "enables": 3, "serves": 1, "duration": 5}},
   {{"type": "LOCAL", "action": "...", "uses": 1, "serves": 1, "duration": 2}},
-  {{"type": "PASS", "item": "...", "target": "R2", "serves": 1, "duration": 1}}
+  {{"type": "LOCAL", "action": "fill the Cup with water at the sink", "uses": 2, "serves": 1, "duration": 1}},
+  {{"type": "PASS", "item": "Cup", "target": "R2", "prepared_by": 4, "serves": 1, "duration": 1}}
  ]
 }}"""
 
