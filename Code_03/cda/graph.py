@@ -18,7 +18,7 @@ import re
 
 import networkx as nx
 
-from .schemas import (ASK_HELP, CONFIRMED, HELP, LOCAL, PROPOSED, PROVIDER_TYPES, RECEIVE,
+from .schemas import (ASK_HELP, CONFIRMED, HELP, LOCAL, PASS, PROPOSED, PROVIDER_TYPES, RECEIVE,
                       REQUEST_TYPES, SEQ, Edge, Node, Offer, TaskConfig, norm)
 
 _STOP = set("a an the to of on in at into onto from for with and or by it its them their this that "
@@ -52,8 +52,9 @@ class PlanGraph:
         self.nodes: dict[str, Node] = {n.id: n for a in cfg.ids for n in plans[a]}
         self.order: dict[str, list[str]] = {a: [n.id for n in plans[a]] for a in cfg.ids}
         self.collab: dict[tuple[str, str], Edge] = {e.key: e for e in collab}
+        judgments = [j for j in (judgments or []) if j.get("request")]     # offer records handled below
         self.reasons = {(j.get("provider"), j["request"]): j.get("reason", "")
-                        for j in (judgments or []) if j.get("provider")}
+                        for j in judgments if j.get("provider")}
         self.replies: dict[str, list[str]] = {}          # request id -> why others did not serve it
         for j in judgments or []:
             if not j.get("provider") and j.get("decision") not in (None, "ignore"):
@@ -67,6 +68,7 @@ class PlanGraph:
         self.n_released = 0
         self.n_tightened = 0
         self.n_prep_dropped = 0
+        self.n_offers_untaken = 0
         self.request_outcome: dict[str, str] = {}        # request id -> declined | failed | moot
         self._initial_nodes = set(self.nodes)
         self._agreements = {(self.nodes[e.src].agent, e.dst) for e in collab if e.status == CONFIRMED}
@@ -185,6 +187,10 @@ class PlanGraph:
     def apply_rules(self) -> None:
         """Deterministic cleanup that needs no judgment."""
         for n in list(self.nodes.values()):
+            if n.status == "active" and n.type == PASS and n.origin == "offer" and \
+                    not any(e.src == n.id for e in self.collab.values()):
+                if self.drop(n.id, f"offer not taken by {n.target}", "rule") is None:
+                    self.n_offers_untaken += 1
             if n.status == "active" and n.type == LOCAL and n.violations:
                 self.drop(n.id, "capability check failed: " + "; ".join(n.violations), "rule")
         for rid, r in self.nodes.items():
@@ -394,7 +400,9 @@ class PlanGraph:
                                            "by": "rule"})
 
     _PREP = re.compile(r"\b(pick-?up|hand-?off|hand over|handover|collection|pass(ing)?|transfer|staging)\s+"
-                       r"(area|spot|point|zone|station|location)\b", re.I)
+                       r"(area|spot|point|zone|station|location)\b"
+                       r"|\bfor (collection|pick-?up|hand-?off|hand-?over|delivery|transfer)\b"
+                       r"|\b(side of|by|near|beside|next to|at) the [a-z ]*door(way)?\b", re.I)
 
     def _drop_unrequested_handoff_prep(self) -> None:
         """PASS already includes picking the object up. A LOCAL step that only stages an object at a
