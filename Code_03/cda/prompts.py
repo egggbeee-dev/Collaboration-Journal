@@ -15,24 +15,29 @@ OFFER_SYSTEM = """You are robot {agent}, one of several heterogeneous household 
 Each robot sees only its own room. Nobody, including a central system, sees everything.
 You cannot explore: reason only from your images, the text about areas you cannot see, and your body.
 
-Write an OFFER: what YOU can contribute, which part of the task YOU intend to take, and what you need.
-Be strict about your embodiment: list in can_do only actions your body can really perform.
-"has_items" lists EVERY task-relevant movable object you can see in your room, even if you would
-move it yourself, so that others know where things are.
-"intends" is the part of the task you plan to take on yourself. Decide it from the TASK, not from
-your room: first think about what the task needs most (its stated priorities, the people it is for,
-the deadline), then pick the parts where your body makes the biggest difference. Your own room is
-only a good choice if it matters for the task. If you are mobile, you may intend work in any room.
-Other robots declare their intentions at the same time; prefer parts only you can do well.
+Write an OFFER: what YOU can contribute to THIS task, which part YOU intend to take, and what you need.
+
+Think in this order and write it in "reasoning":
+ 1. GOAL STATE: when this task is done, what must be true in the house?
+ 2. PRIORITY: which of those matter most (the task's stated priorities, the people it is for, the deadline)?
+ 3. MY CONTRIBUTION: which of the important ones can MY body and MY position change the most?
+Only then fill the fields.
+
+- "can_do": only actions your body can really perform, phrased as task-relevant actions.
+- "has_items": EVERY task-relevant movable object you can see in your room, even if you would move it
+  yourself, so that others know where things are.
+- "intends": the important parts of the task you will take on. Decide from the TASK, not from your room.
+  If you are mobile you may intend work in any room. If nothing important needs you, leave it EMPTY:
+  doing nothing is better than inventing work that is not part of the task.
 
 Return JSON:
 {{
- "reasoning": "short reasoning about the task, your room, and your body",
+ "reasoning": "1. goal state ... 2. priority ... 3. my contribution ...",
  "capability": "one sentence about your embodiment",
  "can_do": ["concrete action you can perform", ...],
  "cannot_do": ["task-relevant action you cannot perform, and why", ...],
  "has_items": ["task-relevant movable object visible in your room", ...],
- "intends": ["part of the task you plan to do", ...],
+ "intends": ["important part of the task you will do", ...],
  "need_from_others": ["what you will need from other robots to do your intended part", ...],
  "obs_scope": "what you can and cannot observe"
 }}"""
@@ -56,45 +61,50 @@ Your camera images are attached ({n_img} image(s))."""
 PLAN_SYSTEM = """You are robot {agent}. Make YOUR OWN local plan for YOUR part of the shared task.
 Nobody assigns you work, and you do not assign work to others.
 
-Which part is yours:
-- Start from your own "intends" in your offer.
-- Do NOT plan parts that another robot intends to do. They will plan those themselves.
-- If a part of the task appears in nobody's "intends" and you can do it, you may take it.
-- Follow the task's priorities: do the most important work first.
-- Use the time you have. If your part is done well before the deadline and you can still help the
-  task's most important areas (without repeating what another robot intends), add that work.
+STEP 1 - GOALS. Write "goals": what must be true when the task is done, each with a priority
+(high / medium / low) taken from the task itself. Only goals of the TASK, not general housekeeping.
 
-Step types you may use (only these three):
-- LOCAL:    something you do yourself. Must cite "uses": the index of the can_do entry it relies on.
-            "location" is the room where it happens (your own room unless you are mobile).
+STEP 2 - YOUR PART. Start from your own "intends". Do NOT plan parts another robot intends.
+If an important goal is in nobody's "intends" and you can do it, you may take it.
+If nothing important needs you, return an EMPTY "steps" list. An idle robot is fine; invented
+work that the task did not ask for is a mistake.
+
+STEP 3 - STEPS. Every step must serve one of YOUR goals: "serves" is the index of that goal.
+Do high-priority goals first. Use only these step types:
+- LOCAL:    something you do yourself. "uses": index of the can_do entry it relies on.
+            "location": the room where it happens (your own room unless you are mobile).
 - ASK_HELP: another robot must DO something before one of YOUR OWN later LOCAL steps can happen.
-            Requires "target", "action", and "enables".
+            Requires "target", "action", "enables".
 - RECEIVE:  you need an OBJECT for one of YOUR OWN later LOCAL steps.
-            Requires "target", "item" (copied exactly from the target's has_items), and "enables".
+            Requires "target", "item" (copied exactly from the target's has_items), "enables".
+"enables" is the index (0-based, in your "steps" list) of YOUR OWN later LOCAL step that is
+physically impossible before the request is done (e.g. you cannot put the Mug on the table before
+you receive the Mug). Never request parts of the task your own steps do not depend on.
 
-"enables" is the index (0-based, in your "steps" list) of YOUR OWN later LOCAL step that cannot
-happen without this request. A request without such a step is not allowed: never ask other robots
-to do parts of the task that your own steps do not depend on.
+OBJECT HANDOFFS (only one way):
+- The robot that NEEDS an object writes RECEIVE. That is all.
+- The robot that HAS the object writes NOTHING about the handoff now: no "come and get it" request,
+  no "put it into R3's gripper" step. If someone sends RECEIVE, it will answer later with a PASS.
+- A mobile giver brings the object to the receiver; an immobile giver leaves it at its room's handoff
+  spot and the receiver (if mobile) picks it up. If neither can move, the handoff is impossible.
 
-How objects move: an object changes rooms only when a mobile robot carries it. When you RECEIVE an
-item, the giver puts it at its room's handoff spot and you (if you are mobile) go there to pick it
-up. If you are NOT mobile, use ASK_HELP to ask a mobile robot to bring it to you instead.
-
-Physical rules (simulator): a robot holds at most ONE object at a time. Write moving an object as
-ONE step that says where it goes, e.g. "move the Mug from the counter to the CoffeeTable".
-Never write a pick-up without a destination. Fixed furniture (beds, counters, sinks, bathtubs)
-cannot be moved. Every step must change the room toward the task's goal; skip steps that don't.
+PHYSICAL RULES (simulator): a robot holds at most ONE object at a time. Write moving an object as
+ONE step with its destination, e.g. "move the Mug from the counter to the CoffeeTable". Fixed
+furniture (beds, counters, sinks, bathtubs) cannot be moved. Do NOT write steps that only move,
+look, check, search or verify: robots cannot explore, travel is added automatically, and what other
+robots see is already in their offers.
 
 "duration" is minutes, one of {durations}. Order the steps in the order you would execute them.
 
 Return JSON:
 {{
- "reasoning": "which part is yours, what it needs, and what you depend on",
+ "reasoning": "which goals matter, which part is mine, what I depend on",
+ "goals": [{{"goal": "...", "priority": "high"}}, {{"goal": "...", "priority": "low"}}],
  "steps": [
-  {{"type": "RECEIVE", "item": "...", "target": "R1", "location": "kitchen", "enables": 1, "duration": 1}},
-  {{"type": "LOCAL", "action": "...", "uses": 0, "location": "living room", "duration": 3}},
-  {{"type": "ASK_HELP", "action": "...", "target": "R2", "location": "living room", "enables": 3, "duration": 5}},
-  {{"type": "LOCAL", "action": "...", "uses": 1, "location": "living room", "duration": 2}}
+  {{"type": "RECEIVE", "item": "...", "target": "R1", "location": "kitchen", "enables": 1, "serves": 0, "duration": 1}},
+  {{"type": "LOCAL", "action": "move ... from ... to ...", "uses": 0, "location": "living room", "serves": 0, "duration": 3}},
+  {{"type": "ASK_HELP", "action": "...", "target": "R2", "location": "living room", "enables": 3, "serves": 1, "duration": 5}},
+  {{"type": "LOCAL", "action": "...", "uses": 1, "location": "living room", "serves": 1, "duration": 2}}
  ]
 }}"""
 
@@ -137,8 +147,9 @@ If you accept or volunteer, you add ONE step to your own plan:
 - for ASK_HELP you will add a HELP step: give "action" and "uses" (index into your can_do).
   You hold one object at a time; write object moves as "move X from A to B".
 - for RECEIVE you will add a PASS step: give "item", copied exactly from YOUR has_items.
-  PASS means you put the item at your room's handoff spot; the requester picks it up.
-  Insert the PASS AFTER the step of yours that gets the item ready (e.g. after picking it up).
+  If you are mobile, PASS means you bring the item to the requester. If you are not mobile, it means
+  you put it at your room's handoff spot and the requester picks it up.
+  The PASS step includes picking the item up. Do not add other steps for the handoff.
 - "insert_after": the id of the step in your plan after which you do it, or "START".
 - "duration": minutes, one of {durations}.
 
