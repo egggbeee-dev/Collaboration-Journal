@@ -40,6 +40,7 @@ def _jaccard(a: str, b: str) -> float:
 
 
 DUP_THRESHOLD = 0.5
+RELEASE_THRESHOLD = 0.6     # stricter: used without an LLM, only for steps that cannot run anyway
 WORK_TYPES = {LOCAL, HELP}
 
 
@@ -53,6 +54,13 @@ class PlanGraph:
         self.collab: dict[tuple[str, str], Edge] = {e.key: e for e in collab}
         self.reasons = {(j.get("provider"), j["request"]): j.get("reason", "")
                         for j in (judgments or []) if j.get("provider")}
+        self.replies: dict[str, list[str]] = {}          # request id -> why others did not serve it
+        for j in judgments or []:
+            if not j.get("provider") and j.get("decision") not in (None, "ignore"):
+                self.replies.setdefault(j["request"], []).append(
+                    f"{j['agent']}: {j.get('result', j.get('decision'))} ({j.get('reason', '')})")
+        self.n_released = 0
+        self.n_tightened = 0
         self._initial_nodes = set(self.nodes)
         self._agreements = {(self.nodes[e.src].agent, e.dst) for e in collab if e.status == CONFIRMED}
         self.ops_log: list[dict] = []
@@ -102,7 +110,14 @@ class PlanGraph:
         return any(e.status == CONFIRMED and nid in e.key for e in self.collab.values())
 
     # ------------------------------------------------------------ primitive mutations
+    def enabling_requests(self, nid: str) -> list[Node]:
+        return [r for r in self.nodes.values() if r.type in REQUEST_TYPES and r.enables == nid
+                and r.status == "active"]
+
     def drop(self, nid: str, reason: str, by: str) -> str | None:
+        """Release a step. Dropping a LOCAL step also withdraws the requests that existed only to
+        enable it (a request is a dependency of its own step, nothing else). Refused if that would
+        break an agreement another robot already made (a CONFIRMED provider)."""
         n = self.nodes.get(nid)
         if n is None or n.status != "active":
             return "node not active"
@@ -110,11 +125,20 @@ class PlanGraph:
             return "request steps cannot be dropped"
         if self.has_confirmed(nid):
             return "node has a CONFIRMED edge"
+        reqs = self.enabling_requests(nid)
+        if any(e.status == CONFIRMED for r in reqs for e in self.providers_of(r.id)):
+            return "another robot already agreed to supply this step's inputs"
         n.status = "dropped"
         for k in [k for k in self.collab if nid in k]:
             del self.collab[k]
         self.drops.append({"node": nid, "agent": n.agent, "type": n.type, "text": n.text(),
                            "reason": reason, "by": by})
+        for r in reqs:                                    # withdraw now-moot requests (+ volunteers)
+            for e in self.providers_of(r.id):
+                self.drop(e.src, f"request {r.id} withdrawn", by)
+            r.status = "dropped"
+            self.drops.append({"node": r.id, "agent": r.agent, "type": r.type, "text": r.text(),
+                               "reason": f"withdrawn: the step it enabled ({nid}) was released", "by": by})
         return None
 
     def move(self, nid: str, after: str) -> str | None:
@@ -190,10 +214,14 @@ class PlanGraph:
             pair = frozenset((x.id, y.id))
             if pair in self.dismissed_dups:
                 continue
+            if x.agent == y.agent and x.origin == "local" and y.origin == "local":
+                continue           # a robot's own planned steps are intentional (e.g. two different chairs)
             sx = {e.dst for e in self.collab.values() if e.src == x.id}
             sy = {e.dst for e in self.collab.values() if e.src == y.id}
             if sx & sy:            # competing answers to one request -> MULTIPLE_VOLUNTEERS handles it
                 continue
+            if x.location and y.location and norm(x.location) != norm(y.location):
+                continue           # work in different rooms is never the same work
             sim = _jaccard(x.action, y.action)
             if sim >= DUP_THRESHOLD:
                 issues.append({"id": f"I{next(cid)}", "issue": "DUPLICATE_WORK",
@@ -215,7 +243,13 @@ class PlanGraph:
 
     def _work_view(self, n: Node) -> dict:
         serves = [{"request": e.dst, "edge": e.status} for e in self.collab.values() if e.src == n.id]
-        return n.brief() | {"location": n.location, "serves": serves,
+        inputs = []
+        for r in self.enabling_requests(n.id):
+            provs = self.providers_of(r.id)
+            inputs.append(r.brief() | {"served_by": [e.src for e in provs] or None,
+                                       "replies": self.replies.get(r.id, [])})
+        return n.brief() | {"location": n.location, "serves": serves, "inputs": inputs,
+                            "can_run": all(i["served_by"] for i in inputs),
                             "has_confirmed": self.has_confirmed(n.id)}
 
     def _cand(self, e: Edge) -> dict:
@@ -226,6 +260,7 @@ class PlanGraph:
 
     # ------------------------------------------------------------ 4c/4d: LLM ops
     def apply_op(self, op: dict, issues: list[dict]) -> str | None:
+        op = normalize_op(op)
         kind = op.get("op")
         by_req = {i["request"]["id"]: i for i in issues if i["issue"] == "MULTIPLE_VOLUNTEERS"}
         mentioned = _ids_in(issues)
@@ -292,6 +327,8 @@ class PlanGraph:
                         self.drop(e.src, "ambiguous volunteers left unresolved", "rule")
                     self.unresolved.append({"request": rid, "why": "multiple volunteers, no choice",
                                             "by": "rule"})
+        self._tighten_requests()
+        self._release_redundant_branches()
         for iss in self.detect_issues():
             if iss["issue"] == "DUPLICATE_WORK":
                 self.warnings.append({"issue": "possible DUPLICATE_WORK left", "nodes": [n["id"] for n in iss["nodes"]],
@@ -313,6 +350,49 @@ class PlanGraph:
             self.nodes[b].status = "blocked"
         self.schedule()
 
+    def _tighten_requests(self) -> None:
+        """A request only has to be satisfied before the step it enables. If a robot wrote it earlier,
+        it would sit idle waiting while it could do its independent work. Move each request to just
+        before its enabled step (WHEN only; the robot's own actions and their order are unchanged).
+        Reverted if it would create a dependency cycle."""
+        self.n_tightened = 0
+        for r in [n for n in self.nodes.values() if n.type in REQUEST_TYPES and n.status == "active"]:
+            if not r.enables or not self.active(r.enables):
+                continue
+            ids = self.order[r.agent]
+            i, j = ids.index(r.id), ids.index(r.enables)
+            if j <= i + 1:
+                continue
+            between = [x for x in ids[i + 1:j] if self.active(x)]
+            if not between:
+                continue
+            old = list(ids)
+            ids.remove(r.id)
+            ids.insert(ids.index(r.enables), r.id)
+            if not nx.is_directed_acyclic_graph(self.nx()):
+                self.order[r.agent] = old
+                continue
+            self.n_tightened += 1
+
+    def _release_redundant_branches(self) -> None:
+        """A step that cannot run (an input request nobody serves) while another robot runs the same
+        work with all inputs served is redundant, not a failure: release it and its requests."""
+        for r in [r for r in self.nodes.values() if r.type in REQUEST_TYPES and r.status == "active"]:
+            if r.status != "active" or self.providers_of(r.id) or not r.enables:
+                continue
+            step = self.nodes.get(r.enables)
+            if step is None or step.status != "active":
+                continue
+            twin = next((o for o in self.nodes.values()
+                         if o.id != step.id and o.status == "active" and o.type in WORK_TYPES
+                         and frozenset((o.id, step.id)) not in self.dismissed_dups   # LLM said: different
+                         and norm(o.location) == norm(step.location)
+                         and _jaccard(o.action, step.action) >= RELEASE_THRESHOLD
+                         and all(self.providers_of(q.id) for q in self.enabling_requests(o.id))), None)
+            if twin and self.drop(step.id, f"redundant: {twin.id} ({twin.agent}) does the same work "
+                                           f"and can run", "rule") is None:
+                self.n_released += 1
+
     def schedule(self) -> None:
         """Times from durations + dependencies. Each robot's current room is tracked, so travel
         (cfg.travel_min) is added only when a mobile robot actually changes room.
@@ -329,8 +409,11 @@ class PlanGraph:
                 nxt = self.nodes.get(n.enables) if n.enables else None
                 place = (nxt.location if nxt else None) if mobile[n.agent] else None
             elif n.type == PASS:
-                place = None
-                n.location = cur[n.agent]                     # item is put down where the robot is
+                if mobile[n.agent]:                           # mobile giver brings it to the receiver
+                    place = n.location
+                else:                                         # immobile giver: handoff spot where it is
+                    place = None
+                    n.location = cur[n.agent]
             elif n.type == RECEIVE:
                 place = self.nodes[collab_preds[0]].location if collab_preds else n.location
             else:
@@ -369,6 +452,32 @@ class PlanGraph:
                 "edges": [asdict(e) for e in self.seq_edges() + list(self.collab.values())],
                 "drops": self.drops, "unresolved": self.unresolved, "warnings": self.warnings,
                 "ops_log": self.ops_log}
+
+
+_OP_KEYS = ("op", "operation", "type", "action", "decision")
+_OP_NAMES = {"connect", "disconnect", "move", "drop", "merge", "unresolved"}
+
+
+def normalize_op(op) -> dict:
+    """LLMs sometimes write {"operation": "drop"}, {"type": "unresolved"}, {"drop": "r1_s2"} or
+    {"issue": "I1", "decision": "not duplicate"}. Map these onto {"op": ...}."""
+    if not isinstance(op, dict):
+        return {"op": None}
+    op = dict(op)
+    kind = next((str(op[k]).lower().strip() for k in _OP_KEYS
+                 if isinstance(op.get(k), str) and str(op[k]).lower().strip() in _OP_NAMES), None)
+    if kind is None:
+        hit = next((k for k in op if k.lower() in _OP_NAMES), None)
+        if hit:
+            kind, val = hit.lower(), op.pop(hit)
+            if isinstance(val, str):
+                op.setdefault("issue" if kind == "unresolved" else "node", val)
+    if kind is None and "issue" in op:
+        kind = "unresolved"
+    op["op"] = kind
+    if kind == "unresolved" and "why" not in op:
+        op["why"] = str(op.get("decision") or op.get("reason") or "")
+    return op
 
 
 def _ids_in(obj) -> set[str]:
