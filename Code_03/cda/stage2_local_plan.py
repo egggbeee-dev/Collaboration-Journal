@@ -12,6 +12,8 @@ LOCAL steps with violations are dropped in Stage 4.
 """
 from __future__ import annotations
 
+import re
+
 from .llm import BaseLLM
 from .log import EventLog
 from .prompts import PLAN_FIX, PLAN_USER, _j, indexed, plan_system
@@ -19,9 +21,16 @@ from .schemas import (ASK_HELP, LOCAL, RECEIVE, REQUEST_TYPES, Node, Offer, Task
                       agent_num, norm, snap_duration)
 
 
-def validate(raw_steps: list[dict], agent: str, offers: dict[str, Offer], cfg: TaskConfig
-             ) -> tuple[list[dict], list[str]]:
-    """Return cleaned step dicts (each with a 'violations' list) and readable error strings."""
+# No exploration in this setting, and movement is added by the scheduler: steps that only look,
+# check or search for something do not change the world and are not allowed.
+_OBSERVE = re.compile(r"\b(check|checks|checking|search|searching|look for|looking for|find|finding|"
+                      r"inspect|verify|scan|locate|explore|availability)\b", re.I)
+
+
+def validate(raw_steps: list[dict], agent: str, offers: dict[str, Offer], cfg: TaskConfig,
+             goals: list | None = None) -> tuple[list[dict], list[str]]:
+    """Return cleaned step dicts (each with a 'violations' list) and readable error strings.
+    If `goals` is given (the robot's own goal list), every step must cite one via "serves"."""
     me = cfg.agent(agent)
     own = offers[agent]
     cleaned, errors = [], []
@@ -41,6 +50,29 @@ def validate(raw_steps: list[dict], agent: str, offers: dict[str, Offer], cfg: T
             errors.append(f"step {i}: type '{t}' is not allowed (use LOCAL, ASK_HELP, RECEIVE)")
             continue
 
+        if goals is not None:
+            sv = s.get("serves")
+            if isinstance(sv, str) and sv.strip().isdigit():
+                sv = int(sv.strip())
+            if not isinstance(sv, int) or not (0 <= sv < len(goals)):
+                v.append(f"step must cite in 'serves' the index of one of your goals (got {sv}); "
+                         f"drop steps that serve none of the task's goals")
+                step["serves"] = None
+            else:
+                g = goals[sv]
+                step["serves"] = str(g.get("goal", g) if isinstance(g, dict) else g)
+        own_items = {norm(x) for x in own.has_items}
+        others = [x for x in cfg.ids if x != agent]
+        if t == ASK_HELP and any(it and it in norm(step["action"]) for it in own_items):
+            v.append(f"ASK_HELP '{step['action']}' is about your own object. Handoffs go only one way: "
+                     f"the robot that needs it writes RECEIVE; you write nothing about it now")
+        if t == LOCAL and any(re.search(rf"\b{o}\b", step["action"], re.I) for o in others):
+            v.append(f"LOCAL '{step['action']}' hands something to another robot. Do not plan handoffs: "
+                     f"the receiver writes RECEIVE and you answer later with a PASS")
+        if t in (LOCAL, ASK_HELP) and _OBSERVE.search(step["action"]):
+            v.append(f"{t} '{step['action']}' only looks/checks/searches. Robots cannot explore and "
+                     f"movement is added automatically: write only steps that change the room "
+                     f"(what the others can see is in their offers)")
         if t == LOCAL:
             u = step["uses"]
             if not isinstance(u, int) or not (0 <= u < len(own.can_do)):
@@ -87,7 +119,7 @@ def validate(raw_steps: list[dict], agent: str, offers: dict[str, Offer], cfg: T
         else:
             step["enables"] = None
         errors += [f"step {i}: {x}" for x in step["violations"]]
-    if not cleaned:
+    if not cleaned and raw_steps:
         errors.append("plan has no valid steps")
     return cleaned, errors
 
@@ -105,7 +137,7 @@ async def make_local_plan(cfg: TaskConfig, agent: str, offers: dict[str, Offer],
                             "payload_kg": a.profile.payload_kg} for a in cfg.agents}),
     )
     d = await llm.complete(system, user, key=f"plan:{agent}")
-    steps, errors = validate(d.get("steps", []), agent, offers, cfg)
+    steps, errors = validate(d.get("steps", []), agent, offers, cfg, d.get("goals") or [])
     n_fix = 0
     while errors and n_fix < max_fix:
         n_fix += 1
@@ -113,12 +145,12 @@ async def make_local_plan(cfg: TaskConfig, agent: str, offers: dict[str, Offer],
         fix_user = user + "\n\nYOUR PREVIOUS PLAN:\n" + _j(d) + "\n\n" + PLAN_FIX.format(
             errors="\n".join(f"- {e}" for e in errors))
         d = await llm.complete(system, fix_user, key=f"plan:{agent}:fix")
-        steps, errors = validate(d.get("steps", []), agent, offers, cfg)
+        steps, errors = validate(d.get("steps", []), agent, offers, cfg, d.get("goals") or [])
 
     n = agent_num(agent)
     nodes = [Node(id=f"r{n}_s{k}", agent=agent, type=s["type"], action=s["action"], item=s["item"],
                   target=s["target"], uses=s["uses"], location=s["location"], duration=s["duration"],
-                  origin="local", violations=s["violations"])
+                  origin="local", violations=s["violations"], serves=s.get("serves"))
              for k, s in enumerate(steps, start=1)]
     raw_to_id = {s["_raw_index"]: nodes[k].id for k, s in enumerate(steps)}
     for s, node in zip(steps, nodes):
@@ -131,4 +163,5 @@ async def make_local_plan(cfg: TaskConfig, agent: str, offers: dict[str, Offer],
     log.log("plan", agent, "broadcast_requests", steps=len(nodes),
             requests=sum(x.type in REQUEST_TYPES and x.status == "active" for x in nodes),
             violations=sum(bool(x.violations) for x in nodes))
-    return nodes, {"reasoning": d.get("reasoning", ""), "fix_rounds": n_fix, "remaining_errors": errors}
+    return nodes, {"reasoning": d.get("reasoning", ""), "goals": d.get("goals") or [],
+                   "fix_rounds": n_fix, "remaining_errors": errors}
