@@ -59,8 +59,15 @@ class PlanGraph:
             if not j.get("provider") and j.get("decision") not in (None, "ignore"):
                 self.replies.setdefault(j["request"], []).append(
                     f"{j['agent']}: {j.get('result', j.get('decision'))} ({j.get('reason', '')})")
+        self.target_reply: dict[str, str] = {}          # request id -> what its target answered
+        for j in judgments or []:
+            r = self.nodes.get(j["request"])
+            if r is not None and j.get("agent") == r.target:
+                self.target_reply[j["request"]] = str(j.get("result") or j.get("decision") or "")
         self.n_released = 0
         self.n_tightened = 0
+        self.n_prep_dropped = 0
+        self.request_outcome: dict[str, str] = {}        # request id -> declined | failed | moot
         self._initial_nodes = set(self.nodes)
         self._agreements = {(self.nodes[e.src].agent, e.dst) for e in collab if e.status == CONFIRMED}
         self.ops_log: list[dict] = []
@@ -333,22 +340,70 @@ class PlanGraph:
             if iss["issue"] == "DUPLICATE_WORK":
                 self.warnings.append({"issue": "possible DUPLICATE_WORK left", "nodes": [n["id"] for n in iss["nodes"]],
                                       "similarity": iss["similarity"]})
+        self._drop_unrequested_handoff_prep()
         g = self.nx()
-        blocked_roots = set()
+        roots: list[tuple[str, str]] = []             # (node id, cause)
         for rid, r in self.nodes.items():
             if r.type in REQUEST_TYPES and self.active(rid) and not self.providers_of(rid):
-                blocked_roots.add(rid)
-                self.unresolved.append({"request": rid, "agent": r.agent, "text": r.text(),
-                                        "why": "no robot provides this", "by": "rule"})
+                reply = self.target_reply.get(rid, "")
+                declined = reply.startswith("reject") or reply.startswith("rejected_by_check")
+                cause = "declined" if declined else "failed"
+                self.request_outcome[rid] = cause
+                roots.append((rid, cause))
+                self.unresolved.append({"request": rid, "agent": r.agent, "text": r.text(), "outcome": cause,
+                                        "why": f"{r.target} declined: {reply}" if declined
+                                        else "no robot provides this", "by": "rule"})
         for cyc in nx.simple_cycles(g):
-            blocked_roots |= set(cyc)
+            roots += [(c, "failed") for c in cyc]
             self.unresolved.append({"cycle": cyc, "why": "dependency cycle remains", "by": "rule"})
-        to_block = set(blocked_roots)
-        for b in blocked_roots:
-            to_block |= nx.descendants(g, b)
-        for b in to_block:
-            self.nodes[b].status = "blocked"
+        self._propagate_block(roots)
         self.schedule()
+
+    def _propagate_block(self, roots: list[tuple[str, str]]) -> None:
+        """Block only what really depends on a failed request (not the robot's later, unrelated steps):
+        request -> the step it enables -> requests that step was serving (other robots) -> ...
+        Other inputs of a blocked step are no longer needed: those requests and their providers are
+        'skipped'. The robot simply skips blocked/skipped steps and continues its own sequence."""
+        queue = list(roots)
+        while queue:
+            nid, cause = queue.pop()
+            n = self.nodes.get(nid)
+            if n is None or n.status != "active":
+                continue
+            n.status = "blocked"
+            n.violations = n.violations + [f"blocked ({cause})"]
+            if n.type in REQUEST_TYPES:
+                if n.enables:
+                    queue.append((n.enables, cause))
+                else:                                         # no dependency info: block what follows
+                    ids = self.order[n.agent]
+                    queue += [(x, cause) for x in ids[ids.index(nid) + 1:]]
+                continue
+            for e in [e for e in self.collab.values() if e.src == nid]:      # it served other robots
+                queue.append((e.dst, cause))
+                self.request_outcome.setdefault(e.dst, cause)
+            for r in self.enabling_requests(nid):                             # its other inputs: moot
+                r.status = "skipped"
+                self.request_outcome[r.id] = "moot"
+                for e in self.providers_of(r.id):
+                    p = self.nodes[e.src]
+                    if not any(self.active(x.dst) for x in self.collab.values() if x.src == p.id):
+                        p.status = "skipped"
+                        self.drops.append({"node": p.id, "agent": p.agent, "type": p.type, "text": p.text(),
+                                           "reason": f"not needed: {r.id} is moot ({nid} cannot run)",
+                                           "by": "rule"})
+
+    _PREP = re.compile(r"\b(pick-?up|hand-?off|hand over|handover|collection|pass(ing)?|transfer|staging)\s+"
+                       r"(area|spot|point|zone|station|location)\b", re.I)
+
+    def _drop_unrequested_handoff_prep(self) -> None:
+        """PASS already includes picking the object up. A LOCAL step that only stages an object at a
+        pickup/handoff spot is either redundant (a PASS exists) or serves nobody: release it."""
+        for n in list(self.nodes.values()):
+            if n.status == "active" and n.type == LOCAL and self._PREP.search(n.action or ""):
+                if self.drop(n.id, "handoff preparation: objects leave a room only through PASS on request",
+                             "rule") is None:
+                    self.n_prep_dropped += 1
 
     def _tighten_requests(self) -> None:
         """A request only has to be satisfied before the step it enables. If a robot wrote it earlier,
