@@ -403,9 +403,11 @@ class PlanGraph:
         self._pass_after_prep()
         roots: list[tuple[str, str]] = []             # (node id, cause)
         roots += self._resolve_carriers()
+        handled = {r for r, _ in roots}
         g = self.nx()
         for rid, r in self.nodes.items():
-            if r.type in REQUEST_TYPES and self.active(rid) and not self.providers_of(rid) and r.basis != "carry":
+            if r.type in REQUEST_TYPES and self.active(rid) and not self.providers_of(rid) and \
+                    r.basis != "carry" and rid not in handled:
                 reply = self.target_reply.get(rid, "")
                 declined = reply.startswith("reject") or reply.startswith("rejected_by_check")
                 cause = "declined" if declined else "failed"
@@ -491,37 +493,53 @@ class PlanGraph:
         return (pas[0] if pas else None), h
 
     def _resolve_carriers(self) -> list[tuple[str, str]]:
-        """Carry requests: if the handoff did not happen, the carrying is moot; if nobody carries, the
-        receiver cannot get the object (its RECEIVE is blocked); otherwise chain PASS -> carry -> RECEIVE."""
+        """Carry requests, grouped by the handoff (PASS, RECEIVE) they serve: giver and receiver may both
+        have asked. If the handoff did not happen, carrying is moot. If any request of the group has a
+        carrier, that one carries and the others are covered. If none has, the receiver cannot get the
+        object (its RECEIVE is blocked; declined if a named carrier said no)."""
         roots = []
+        groups: dict = {}
         for c in [n for n in self.nodes.values() if n.basis == "carry" and n.status == "active"]:
             pas, rcv = self._handoff_pair(c)
-            helpers = [self.nodes[e.src] for e in self.providers_of(c.id)]
             if pas is None or rcv is None:
-                c.status = "skipped"
+                self._skip_carry(c, f"carrying not needed: the handoff for {c.carry_for} did not happen")
                 self.request_outcome[c.id] = "moot"
                 self.n_carry_moot += 1
-                for h in helpers:
-                    h.status = "skipped"
-                    self.drops.append({"node": h.id, "agent": h.agent, "type": h.type, "text": h.text(),
-                                       "reason": f"carrying not needed: the handoff for {c.carry_for} did not happen",
-                                       "by": "rule"})
                 continue
-            if not helpers:
-                reply = self.target_reply.get(c.id, "")
-                cause = "declined" if reply.startswith("reject") else "failed"
+            groups.setdefault((pas.id, rcv.id), []).append(c)
+        for (pid, rid), cs in groups.items():
+            pas, rcv = self.nodes[pid], self.nodes[rid]
+            served = [(c, self.nodes[e.src]) for c in cs for e in self.providers_of(c.id)]
+            if served:
+                c0, h = served[0]
+                for c in cs:
+                    if c is not c0:
+                        self._skip_carry(c, f"covered: {h.agent} already carries this object ({h.id})")
+                        self.request_outcome[c.id] = "covered"
+                self.carry_edges += [Edge(pas.id, h.id, "CARRY"), Edge(h.id, rcv.id, "CARRY")]
+                continue
+            declined = any(self.target_reply.get(c.id, "").startswith("reject") for c in cs)
+            cause = "declined" if declined else "failed"
+            for c in cs:
                 self.request_outcome[c.id] = cause
                 self.unresolved.append({"request": c.id, "agent": c.agent, "text": c.text(), "outcome": cause,
-                                        "why": "no mobile robot carries the object", "by": "rule"})
+                                        "why": f"no mobile robot carries the object ({c.target} "
+                                               f"{'declined' if declined else 'did not answer'})", "by": "rule"})
                 c.status = "blocked"
                 c.violations = c.violations + [f"blocked ({cause})"]
-                if pas.status == "active":
-                    pas.status = "skipped"
-                roots.append((rcv.id, cause))
-                continue
-            h = helpers[0]
-            self.carry_edges += [Edge(pas.id, h.id, "CARRY"), Edge(h.id, rcv.id, "CARRY")]
+            if pas.status == "active":
+                pas.status = "skipped"
+            self.request_outcome[rcv.id] = cause
+            roots.append((rcv.id, cause))
         return roots
+
+    def _skip_carry(self, c: Node, reason: str) -> None:
+        c.status = "skipped"
+        for e in self.providers_of(c.id):
+            h = self.nodes[e.src]
+            h.status = "skipped"
+            self.drops.append({"node": h.id, "agent": h.agent, "type": h.type, "text": h.text(),
+                               "reason": reason, "by": "rule"})
 
     def _tighten_requests(self) -> None:
         """A request only has to be satisfied before the step it enables. If a robot wrote it earlier,
