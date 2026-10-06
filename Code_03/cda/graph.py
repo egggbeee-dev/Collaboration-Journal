@@ -39,6 +39,15 @@ def _jaccard(a: str, b: str) -> float:
     return len(x & y) / len(x | y) if x and y else 0.0
 
 
+_TRANSFORM = re.compile(r"\b(fill|refill|rinse|wash|clean|wipe|dry|heat|warm|cool|chill|cut|slice|peel|chop|"
+                        r"cook|toast|brew|pour|unwrap|unpack|fold|charge|switch on|turn on|toggle)\w*\b", re.I)
+
+
+def is_real_preparation(action: str) -> bool:
+    """Changes the object's state (fill, rinse, heat, cut, ...), not only where it lies."""
+    return bool(_TRANSFORM.search(action or ""))
+
+
 DUP_THRESHOLD = 0.5
 RELEASE_THRESHOLD = 0.6     # stricter: used without an LLM, only for steps that cannot run anyway
 WORK_TYPES = {LOCAL, HELP}
@@ -210,13 +219,15 @@ class PlanGraph:
             ids = [x for x in self.order[p.agent] if self.active(x)]
             for x in reversed(ids[:ids.index(p.id)] if p.id in ids else []):
                 n = self.nodes[x]
-                if n.type == LOCAL and len(item & _tokens(n.action)) >= min(2, len(item)) and item:
+                if n.type == LOCAL and item and len(item & _tokens(n.action)) >= min(2, len(item)) \
+                        and is_real_preparation(n.action):
                     p.prepared_by = x
                     break
             else:                                           # written after the PASS: look anywhere
                 for x in ids:
                     n = self.nodes[x]
                     if n.type == LOCAL and item and len(item & _tokens(n.action)) >= min(2, len(item)) and \
+                            is_real_preparation(n.action) and \
                             not any(q.prepared_by == x for q in self.nodes.values() if q.type == PASS):
                         p.prepared_by = x
                         break
@@ -442,7 +453,7 @@ class PlanGraph:
                                            "by": "rule"})
 
     _PREP = re.compile(r"\b(pick-?up|hand-?off|hand over|handover|collection|pass(ing)?|transfer|staging)\s+"
-                       r"(area|spot|point|zone|station|location)\b"
+                       r"(area|spot|point|zone|station|location|position|place|counter|shelf)\b"
                        r"|\bfor (collection|pick-?up|hand-?off|hand-?over|delivery|transfer)\b"
                        r"|\b(side of|by|near|beside|next to|at) the [a-z ]*door(way)?\b", re.I)
 
@@ -451,12 +462,15 @@ class PlanGraph:
         pickup/handoff spot is either redundant (a PASS exists) or serves nobody: release it."""
         preps = {p.prepared_by for p in self.nodes.values() if p.type == PASS and p.status == "active"}
         for n in list(self.nodes.values()):
-            if n.id in preps:                               # the real preparation of an offer: keep it
+            if n.id in preps and is_real_preparation(n.action):   # real preparation of an offer: keep it
                 continue
             if n.status == "active" and n.type == LOCAL and self._PREP.search(n.action or ""):
-                if self.drop(n.id, "handoff preparation: objects leave a room only through PASS on request",
-                             "rule") is None:
+                if self.drop(n.id, "only moves the object to a handoff spot: the PASS itself picks it up "
+                                   "and hands it over", "rule") is None:
                     self.n_prep_dropped += 1
+                    for p in self.nodes.values():
+                        if p.type == PASS and p.prepared_by == n.id:
+                            p.prepared_by = None
 
     def _tighten_requests(self) -> None:
         """A request only has to be satisfied before the step it enables. If a robot wrote it earlier,
