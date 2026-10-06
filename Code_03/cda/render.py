@@ -9,7 +9,9 @@ def _line(g: PlanGraph, nid: str) -> str:
     n = g.nodes[nid]
     prov = g.providers_of(nid)
     partner = g.nodes[prov[0].src].agent if prov else None
-    if n.type == ASK_HELP:
+    if n.type == ASK_HELP and n.basis == "carry":
+        body = f"asks {partner} to {n.action}"
+    elif n.type == ASK_HELP:
         body = f"wait for {partner} to: {n.action}"
     elif n.type == RECEIVE:
         body = f"receive {n.item} from {partner}"
@@ -26,8 +28,10 @@ def _line(g: PlanGraph, nid: str) -> str:
             body += f" (also serves {', '.join(serves)}'s request)"
         if n.travel:
             body += f" [+{n.travel}m back to {n.location}]"
-    if n.type == RECEIVE and prov and n.travel:
-        body += f" [+{n.travel}m to fetch it in the {n.location}]"
+    if n.type == RECEIVE:
+        carrier = [g.nodes[e.src].agent for e in g.carry_edges if e.dst == nid and g.active(e.src)]
+        if carrier:
+            body += f" (carried by {carrier[0]})"
     return f"- {n.agent} [{n.type}] {body}  ({nid})  → t={n.t_end}"
 
 
@@ -110,5 +114,8 @@ def metrics(g: PlanGraph, plan_meta: dict, llm_usage: dict) -> dict:
         "n_offers_taken": sum(1 for e in final_collab if g.nodes[e.src].origin == "offer"),
         "n_offers_untaken": g.n_offers_untaken,
         "n_preparations_released": g.n_prep_released,
+        "n_carry_requests": sum(1 for n in nodes if n.type == "ASK_HELP" and n.basis == "carry"),
+        "n_carries": len([e for e in g.carry_edges if e.dst and g.nodes[e.dst].type == "RECEIVE"
+                          and g.active(e.src) and g.active(e.dst)]),
         **llm_usage,
     }
