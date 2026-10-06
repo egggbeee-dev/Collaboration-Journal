@@ -43,13 +43,14 @@ SPACE RULES (space-separated home):
 - Every robot is responsible for its OWN room and works only there. You never go to another room on
   your own initiative, even if you are mobile.
 - Objects from another room: write RECEIVE to that room's robot. An object only changes rooms when a
-  MOBILE robot carries it: a mobile giver brings it to you; a FIXED giver only hands it over within
-  its reach, so you go and fetch it (if you are mobile). If you are fixed, or you prefer not to go,
-  write ASK_HELP to a mobile robot instead: "bring the X from the <room> to me" (+ "enables").
+  MOBILE robot carries it, and the receiver never leaves its room:
+  * a mobile giver brings the object itself;
+  * a FIXED giver can only hand it over within its reach, so a third, mobile robot must carry it. Whoever
+    starts the handoff names that robot in "carrier" (on the RECEIVE, or on the fixed robot's PASS).
+    It is a request: the carrier decides whether to do it.
 - Work in your room that your body cannot do (out of reach, too heavy, you are fixed in place): write
   ASK_HELP to a robot that can, and say exactly what it should do.
-- A mobile robot leaves its room only to help (HELP), to bring an object it gives, or to fetch an object
-  it receives from a fixed robot.
+- A mobile robot leaves its room only to help (HELP, including carrying) or to bring an object it gives.
 
 Return JSON:
 {{
@@ -120,13 +121,14 @@ SPACE RULES (space-separated home):
 - Every robot is responsible for its OWN room and works only there. You never go to another room on
   your own initiative, even if you are mobile.
 - Objects from another room: write RECEIVE to that room's robot. An object only changes rooms when a
-  MOBILE robot carries it: a mobile giver brings it to you; a FIXED giver only hands it over within
-  its reach, so you go and fetch it (if you are mobile). If you are fixed, or you prefer not to go,
-  write ASK_HELP to a mobile robot instead: "bring the X from the <room> to me" (+ "enables").
+  MOBILE robot carries it, and the receiver never leaves its room:
+  * a mobile giver brings the object itself;
+  * a FIXED giver can only hand it over within its reach, so a third, mobile robot must carry it. Whoever
+    starts the handoff names that robot in "carrier" (on the RECEIVE, or on the fixed robot's PASS).
+    It is a request: the carrier decides whether to do it.
 - Work in your room that your body cannot do (out of reach, too heavy, you are fixed in place): write
   ASK_HELP to a robot that can, and say exactly what it should do.
-- A mobile robot leaves its room only to help (HELP), to bring an object it gives, or to fetch an object
-  it receives from a fixed robot.
+- A mobile robot leaves its room only to help (HELP, including carrying) or to bring an object it gives.
 
 OBJECT HANDOFFS (two ways, both decided by the other side):
 - You NEED an object from another room: write RECEIVE (+ "enables": your step that uses it).
@@ -158,7 +160,7 @@ Return JSON:
   {{"type": "ASK_HELP", "action": "move the heavy ... to ...", "target": "R2", "enables": 3, "serves": 1, "duration": 5}},
   {{"type": "LOCAL", "action": "...", "uses": 1, "serves": 1, "duration": 2}},
   {{"type": "LOCAL", "action": "fill the Cup with water at the sink", "uses": 2, "serves": 1, "duration": 1}},
-  {{"type": "PASS", "item": "Cup", "target": "R2", "prepared_by": 4, "serves": 1, "duration": 1}}
+  {{"type": "PASS", "item": "Cup", "target": "R2", "prepared_by": 4, "carrier": "R3", "serves": 1, "duration": 1}}
  ]
 }}"""
 
@@ -205,10 +207,11 @@ If you accept or volunteer, you add ONE step to your own plan:
   If you already OFFERED exactly this item to this robot (a PASS in your plan), just "accept":
   your offer is linked, no second PASS is added.
   PASS includes picking the item up. If you are mobile, you bring it to the requester. If you are
-  fixed, you hand it over within your reach and the requester comes to fetch it.
+  fixed, you hand it over within your reach to the carrier the requester named.
   Do not add other steps for the handoff.
-- Accept an ASK_HELP for another room (including "bring the X from ... to me") only if your body can
-  do it (you must be mobile) and it does not break your own room's work.
+- Accept an ASK_HELP for another room only if your body can do it (you must be mobile) and it does not
+  break your own room's work. Requests of kind "carry an object" ask you to take an object from a
+  fixed robot and bring it to another robot: accept if you are mobile and have time (you add one HELP).
 - "insert_after": the id of the step in your plan after which you do it, or "START".
 - "duration": minutes, one of {durations}.
 
