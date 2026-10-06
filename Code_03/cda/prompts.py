@@ -89,8 +89,16 @@ TEAM GOAL: the robots are a team. A well-prepared result is better than a minima
 work unrelated to the task, but DO use other rooms' objects and other robots' help whenever they
 make the result better (e.g. water and a towel for a workout).
 
-STEP 1 - GOALS. Write "goals": what must be true when the task is done, each with a priority
-(high / medium / low) taken from the task itself. Only goals of the TASK, not general housekeeping.
+STEP 1 - TASK REASONING. Before planning anything, reason about the task as a whole (in "reasoning"):
+ a) FINISHED STATE: picture the house when the task is done. What is different from now?
+ b) ESSENTIAL vs NICE-TO-HAVE: which changes is the task impossible without (e.g. for a workout area:
+    an open floor with no furniture in the way), and which only make it better (e.g. a towel, water)?
+ c) WHERE: in which room does each change happen?
+ d) YOUR ROOM: for each essential change in YOUR room, can YOUR body do it? If not, it STILL has to
+    happen: write ASK_HELP to a robot whose body can (see the profiles). Never leave essential work out
+    because your body cannot do it, and never replace it with vague steps ("mark", "coordinate").
+Then write "goals": each with "goal", "priority" (high = essential, medium/low = nice-to-have) and
+"in_my_room" (true if it happens in your room). Only goals of the TASK, not general housekeeping.
 
 STEP 2 - YOUR PART. Your part is the work in YOUR room (start from your "intends").
 
@@ -155,7 +163,8 @@ robots see is already in their offers.
 Return JSON:
 {{
  "reasoning": "which goals matter, which part is mine, what I depend on",
- "goals": [{{"goal": "...", "priority": "high"}}, {{"goal": "...", "priority": "low"}}],
+ "goals": [{{"goal": "...", "priority": "high", "in_my_room": true}},
+           {{"goal": "...", "priority": "low", "in_my_room": false}}],
  "steps": [
   {{"type": "RECEIVE", "item": "...", "target": "R1", "enables": 1, "serves": 0, "duration": 1}},
   {{"type": "LOCAL", "action": "move ... from ... to ...", "uses": 0, "serves": 0, "duration": 3}},
@@ -213,6 +222,9 @@ If you accept or volunteer, you add ONE step to your own plan:
   Do not add other steps for the handoff.
 - Accept an ASK_HELP for another room only if your body can do it (you must be mobile) and it does not
   break your own room's work.
+- ESSENTIAL FIRST: a request that the task cannot succeed without (e.g. moving heavy furniture out of
+  the way when the requester's body cannot) matters more than nice-to-have work. Accept it if your
+  body can do it.
 - CARRYING: requests of kind "carry an object" ask you to take an object from a fixed robot and bring it
   to another robot. ANY mobile robot can carry an object its body can lift (a cup, a towel, an apple):
   this needs no special can_do entry. If the request names you, accept unless you are truly busy or the
