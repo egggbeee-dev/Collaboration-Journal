@@ -62,9 +62,11 @@ def render(g: PlanGraph) -> str:
     if g.warnings:
         lines += ["", "### Warnings"]
         lines += [f"- {w}" for w in g.warnings]
-    if g.drops:
+    shown = {n.id for n in blocked + skipped}
+    drops = [d for d in g.drops if d["node"] not in shown or g.nodes[d["node"]].status == "dropped"]
+    if drops:
         lines += ["", "### Dropped"]
-        lines += [f"- {d['agent']} [{d['type']}] {d['text']} — {d['reason']} (by {d['by']})" for d in g.drops]
+        lines += [f"- {d['agent']} [{d['type']}] {d['text']} — {d['reason']} (by {d['by']})" for d in drops]
     return "\n".join(lines)
 
 
