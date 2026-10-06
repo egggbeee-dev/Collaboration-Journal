@@ -145,8 +145,8 @@ class Node:
     enables: str | None = None         # request -> id of the own later step that needs it
     serves: str | None = None          # the task goal (from the robot's own goal list) this step serves
     prepared_by: str | None = None     # offered PASS -> own earlier LOCAL step that prepared the object
-    basis: str = "dependency"          # ASK_HELP: "dependency" (enables a later step) | "time" (parallel help)
-    fallback_self: bool = False        # time-help nobody took: the requester does it itself
+    basis: str = "dependency"          # ASK_HELP: "dependency" (enables a later step) | "carry" (transport)
+    carry_for: str | None = None       # carry request -> id of the PASS or RECEIVE whose object it moves
     status: str = "active"             # active | dropped | blocked
     violations: list[str] = field(default_factory=list)
     travel: int = 0                    # added by the scheduler
