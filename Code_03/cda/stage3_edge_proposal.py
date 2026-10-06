@@ -46,7 +46,8 @@ async def _judge(cfg: TaskConfig, agent: str, plans: dict[str, list[Node]], offe
     user = PROPOSE_USER.format(task=cfg.task, own_offer=_j(offers[agent].to_dict()),
                                can_do_indexed=indexed(offers[agent].can_do),
                                own_plan=_j(_plan_view(plans[agent])),
-                               requests=_j([r.brief() | {"location": r.location} for r in visible]) if visible
+                               requests=_j([r.brief() | {"location": r.location, "basis": r.basis,
+                                                         "duration": r.duration} for r in visible]) if visible
                                else "(none)",
                                offers=_j([p.brief() | {"for": p.serves} for p in to_me]) if to_me else "(none)")
     d = await llm.complete(propose_system(agent), user, key=f"propose:{agent}")
