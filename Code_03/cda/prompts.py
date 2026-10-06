@@ -51,6 +51,7 @@ SPACE RULES (space-separated home):
 - Work in your room that your body cannot do (out of reach, too heavy, you are fixed in place): write
   ASK_HELP to a robot that can, and say exactly what it should do.
 - A mobile robot leaves its room only to help (HELP, including carrying) or to bring an object it gives.
+  Every mobile robot can carry objects its body can lift; carrying needs no special can_do entry.
 
 Return JSON:
 {{
@@ -71,7 +72,7 @@ DEADLINE: {deadline} minutes
 YOUR BODY:
 - room: {room}
 - mobile (can leave its room): {mobile}
-- payload: {payload} kg
+- payload: {payload}
 - embodiment: {embodiment}
 
 ABOUT AREAS YOU CANNOT SEE:
@@ -129,6 +130,7 @@ SPACE RULES (space-separated home):
 - Work in your room that your body cannot do (out of reach, too heavy, you are fixed in place): write
   ASK_HELP to a robot that can, and say exactly what it should do.
 - A mobile robot leaves its room only to help (HELP, including carrying) or to bring an object it gives.
+  Every mobile robot can carry objects its body can lift; carrying needs no special can_do entry.
 
 OBJECT HANDOFFS (two ways, both decided by the other side):
 - You NEED an object from another room: write RECEIVE (+ "enables": your step that uses it).
@@ -210,8 +212,12 @@ If you accept or volunteer, you add ONE step to your own plan:
   fixed, you hand it over within your reach to the carrier the requester named.
   Do not add other steps for the handoff.
 - Accept an ASK_HELP for another room only if your body can do it (you must be mobile) and it does not
-  break your own room's work. Requests of kind "carry an object" ask you to take an object from a
-  fixed robot and bring it to another robot: accept if you are mobile and have time (you add one HELP).
+  break your own room's work.
+- CARRYING: requests of kind "carry an object" ask you to take an object from a fixed robot and bring it
+  to another robot. ANY mobile robot can carry an object its body can lift (a cup, a towel, an apple):
+  this needs no special can_do entry. If the request names you, accept unless you are truly busy or the
+  object is too heavy for your body. If it names someone else but you are mobile and have little to do,
+  volunteer. A carry adds one HELP step to your plan.
 - "insert_after": the id of the step in your plan after which you do it, or "START".
 - "duration": minutes, one of {durations}.
 
