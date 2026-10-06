@@ -200,8 +200,30 @@ class PlanGraph:
                 ids.insert(ids.index(p.prepared_by) + 1, p.id)
 
     # ------------------------------------------------------------ 4b: rule layer
+    def _link_preparations(self) -> None:
+        """An offered PASS without "prepared_by": if an earlier LOCAL step of the same robot handles that
+        object (e.g. "rinse the Metal tumbler and fill it with water"), it is the preparation."""
+        for p in self.nodes.values():
+            if p.type != PASS or p.prepared_by or p.status != "active":
+                continue
+            item = _tokens(p.item or "")
+            ids = [x for x in self.order[p.agent] if self.active(x)]
+            for x in reversed(ids[:ids.index(p.id)] if p.id in ids else []):
+                n = self.nodes[x]
+                if n.type == LOCAL and len(item & _tokens(n.action)) >= min(2, len(item)) and item:
+                    p.prepared_by = x
+                    break
+            else:                                           # written after the PASS: look anywhere
+                for x in ids:
+                    n = self.nodes[x]
+                    if n.type == LOCAL and item and len(item & _tokens(n.action)) >= min(2, len(item)) and \
+                            not any(q.prepared_by == x for q in self.nodes.values() if q.type == PASS):
+                        p.prepared_by = x
+                        break
+
     def apply_rules(self) -> None:
         """Deterministic cleanup that needs no judgment."""
+        self._link_preparations()
         for n in list(self.nodes.values()):
             if n.status == "active" and n.type == PASS and n.origin == "offer" and \
                     not any(e.src == n.id for e in self.collab.values()):
@@ -368,10 +390,6 @@ class PlanGraph:
         g = self.nx()
         roots: list[tuple[str, str]] = []             # (node id, cause)
         for rid, r in self.nodes.items():
-            if r.type in REQUEST_TYPES and self.active(rid) and not self.providers_of(rid) and r.basis == "time":
-                r.fallback_self = True                     # nobody helped: the requester does it itself
-                self.request_outcome[rid] = "self"
-                continue
             if r.type in REQUEST_TYPES and self.active(rid) and not self.providers_of(rid):
                 reply = self.target_reply.get(rid, "")
                 declined = reply.startswith("reject") or reply.startswith("rejected_by_check")
@@ -397,10 +415,6 @@ class PlanGraph:
             nid, cause = queue.pop()
             n = self.nodes.get(nid)
             if n is None or n.status != "active":
-                continue
-            if n.type in REQUEST_TYPES and n.basis == "time":     # helper cannot come: do it yourself
-                n.fallback_self = True
-                self.request_outcome[nid] = "self"
                 continue
             n.status = "blocked"
             n.violations = n.violations + [f"blocked ({cause})"]
@@ -435,7 +449,10 @@ class PlanGraph:
     def _drop_unrequested_handoff_prep(self) -> None:
         """PASS already includes picking the object up. A LOCAL step that only stages an object at a
         pickup/handoff spot is either redundant (a PASS exists) or serves nobody: release it."""
+        preps = {p.prepared_by for p in self.nodes.values() if p.type == PASS and p.status == "active"}
         for n in list(self.nodes.values()):
+            if n.id in preps:                               # the real preparation of an offer: keep it
+                continue
             if n.status == "active" and n.type == LOCAL and self._PREP.search(n.action or ""):
                 if self.drop(n.id, "handoff preparation: objects leave a room only through PASS on request",
                              "rule") is None:
@@ -512,9 +529,7 @@ class PlanGraph:
                     self.warnings.append({"issue": "immobile robot would have to move", "node": nid,
                                           "from": cur[n.agent], "to": place})
             n.t_start = max([self.nodes[p].t_end for p in seq_preds] or [0])
-            if n.type == ASK_HELP and n.basis == "time":
-                n.t_end = n.t_start + (n.duration if n.fallback_self else 0)   # parallel help: no waiting
-            elif n.type == ASK_HELP:
+            if n.type == ASK_HELP:
                 n.t_end = max([n.t_start] + [self.nodes[p].t_end for p in collab_preds])
             elif n.type == RECEIVE:
                 arrive = [self.nodes[p].t_end + self.cfg.handoff_min for p in collab_preds]
