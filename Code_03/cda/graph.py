@@ -368,6 +368,10 @@ class PlanGraph:
         g = self.nx()
         roots: list[tuple[str, str]] = []             # (node id, cause)
         for rid, r in self.nodes.items():
+            if r.type in REQUEST_TYPES and self.active(rid) and not self.providers_of(rid) and r.basis == "time":
+                r.fallback_self = True                     # nobody helped: the requester does it itself
+                self.request_outcome[rid] = "self"
+                continue
             if r.type in REQUEST_TYPES and self.active(rid) and not self.providers_of(rid):
                 reply = self.target_reply.get(rid, "")
                 declined = reply.startswith("reject") or reply.startswith("rejected_by_check")
@@ -393,6 +397,10 @@ class PlanGraph:
             nid, cause = queue.pop()
             n = self.nodes.get(nid)
             if n is None or n.status != "active":
+                continue
+            if n.type in REQUEST_TYPES and n.basis == "time":     # helper cannot come: do it yourself
+                n.fallback_self = True
+                self.request_outcome[nid] = "self"
                 continue
             n.status = "blocked"
             n.violations = n.violations + [f"blocked ({cause})"]
@@ -504,7 +512,9 @@ class PlanGraph:
                     self.warnings.append({"issue": "immobile robot would have to move", "node": nid,
                                           "from": cur[n.agent], "to": place})
             n.t_start = max([self.nodes[p].t_end for p in seq_preds] or [0])
-            if n.type == ASK_HELP:
+            if n.type == ASK_HELP and n.basis == "time":
+                n.t_end = n.t_start + (n.duration if n.fallback_self else 0)   # parallel help: no waiting
+            elif n.type == ASK_HELP:
                 n.t_end = max([n.t_start] + [self.nodes[p].t_end for p in collab_preds])
             elif n.type == RECEIVE:
                 arrive = [self.nodes[p].t_end + self.cfg.handoff_min for p in collab_preds]
