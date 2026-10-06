@@ -140,6 +140,17 @@ def validate(raw_steps: list[dict], agent: str, offers: dict[str, Offer], cfg: T
         else:
             step["enables"] = None
         errors += [f"step {i}: {x}" for x in step["violations"]]
+    # one object per step: several RECEIVEs of different objects feeding ONE step means that step
+    # handles several objects at once (soft: asks the robot to split it, does not drop anything)
+    fed: dict = {}
+    for st in cleaned:
+        if st["type"] == RECEIVE and isinstance(st.get("enables"), int) and st.get("item"):
+            fed.setdefault(st["enables"], set()).add(norm(st["item"]))
+    for idx, items in fed.items():
+        if len(items) > 1:
+            errors.append(f"step {idx} uses {len(items)} received objects at once ({', '.join(sorted(items))}). "
+                          f"A robot holds one object at a time: write one LOCAL step per received object, and "
+                          f"let each RECEIVE enable its own step")
     if not cleaned and raw_steps:
         errors.append("plan has no valid steps")
     return cleaned, errors
