@@ -46,14 +46,23 @@ async def _judge(cfg: TaskConfig, agent: str, plans: dict[str, list[Node]], offe
     user = PROPOSE_USER.format(task=cfg.task, own_offer=_j(offers[agent].to_dict()),
                                can_do_indexed=indexed(offers[agent].can_do),
                                own_plan=_j(_plan_view(plans[agent])),
-                               requests=_j([r.brief() | {"location": r.location, "basis": r.basis,
-                                                         "duration": r.duration} for r in visible]) if visible
+                               requests=_j([r.brief() | {"location": r.location, "duration": r.duration}
+                                            | ({"kind": "carry an object"} if r.basis == "carry" else {})
+                                            for r in visible]) if visible
                                else "(none)",
                                offers=_j([p.brief() | {"for": p.serves} for p in to_me]) if to_me else "(none)")
     d = await llm.complete(propose_system(agent), user, key=f"propose:{agent}")
     js, os_ = d.get("judgments", []) or [], d.get("offers", []) or []
     log.log("propose", agent, "judged", n=len(js), offers=len(os_))
     return js, os_
+
+
+def _carry_ends(req: Node, nodes: dict) -> set:
+    """giver and receiver of the object a carry request moves"""
+    h = nodes.get(req.carry_for)
+    if h is None:
+        return set()
+    return {h.agent, h.target}
 
 
 def _insert(order: list[Node], node: Node, after: str | None) -> None:
@@ -73,6 +82,7 @@ async def edge_proposal(cfg: TaskConfig, plans: dict[str, list[Node]], offers: d
     requests = [n for a in cfg.ids for n in plans[a] if n.type in REQUEST_TYPES and n.status == "active"]
     passes = [n for a in cfg.ids for n in plans[a] if n.type == PASS and n.origin == "offer" and n.status == "active"]
     by_id = {r.id: r for r in requests}
+    by_id_all = {n.id: n for a in cfg.ids for n in plans[a]}
     by_pass = {p.id: p for p in passes}
     raw = await asyncio.gather(*[_judge(cfg, a, plans, offers, requests, passes, llm, log) for a in cfg.ids])
 
@@ -145,6 +155,8 @@ async def edge_proposal(cfg: TaskConfig, plans: dict[str, list[Node]], offers: d
                     problem = f"uses={uses} is not a valid can_do index"
                 elif not me.profile.mobile and norm(req.location) != norm(me.profile.room):
                     problem = f"cannot leave {me.profile.room} to help in {req.location}"
+                elif req.basis == "carry" and agent in _carry_ends(req, by_id_all):
+                    problem = "the giver and the receiver stay in their rooms; another robot must carry it"
                 action = action or req.action
                 location = req.location
             else:
@@ -161,8 +173,7 @@ async def edge_proposal(cfg: TaskConfig, plans: dict[str, list[Node]], offers: d
                     continue
                 if stock[agent][norm(item)] <= 0:
                     problem = f"item '{item}' not available (not in has_items or already promised)"
-                elif not me.profile.mobile and not cfg.agent(req.agent).profile.mobile:
-                    problem = "both robots are fixed: nobody can carry the object between the rooms"
+
                 action = action or f"pass {item} to {req.agent}"
                 location = me.profile.room          # handed over at the room door
             if problem:
@@ -204,10 +215,6 @@ async def edge_proposal(cfg: TaskConfig, plans: dict[str, list[Node]], offers: d
                 continue
             if linked(oid):
                 rec["result"] = "already_linked (you requested it)"
-                record.append(rec)
-                continue
-            if not cfg.agent(agent).profile.mobile and not cfg.agent(p.agent).profile.mobile:
-                rec["result"] = "rejected_by_check: both robots are fixed: nobody can carry the object"
                 record.append(rec)
                 continue
             uses = oj.get("uses")
