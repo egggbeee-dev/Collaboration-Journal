@@ -46,7 +46,7 @@ def norm(s: str | None) -> str:
 class Profile:
     room: str
     mobile: bool
-    payload_kg: float
+    payload_kg: float | None
     embodiment: str            # e.g. "wheeled base, one 6-DoF arm, low reach"
 
 
@@ -91,7 +91,7 @@ class TaskConfig:
             hid = a.get("hidden_info", "")
             hid = "\n".join(hid) if isinstance(hid, list) else (hid or "")
             out.append(AgentInput(f"R{i}", Profile(room=a["room"], mobile=bool(a["mobile"]),
-                                                   payload_kg=float(a.get("payload_kg", 0) or 0),
+                                                   payload_kg=(float(a["payload_kg"]) if a.get("payload_kg") else None),
                                                    embodiment=a["capability"]),
                                   list(a.get("images", [])), hid))
         return cls(task_id, task, deadline_min, out, travel_min, handoff_min)
