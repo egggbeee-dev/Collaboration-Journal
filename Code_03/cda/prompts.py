@@ -92,7 +92,9 @@ STEP 2 - YOUR PART. Your part is the work in YOUR room (start from your "intends
 STEP 3 - FROM OTHER ROOMS. Go through EVERY other robot's "suggests" one by one. For each object that
 would make the result in your room better, write a RECEIVE followed by your own LOCAL step that uses it
 (e.g. RECEIVE Towel, then "move the Towel to the edge of the workout area"). Do not skip a useful
-object just because you could finish without it.
+object just because you could finish without it. One object per purpose: if a purpose is already
+covered (one towel, one drink), do not ask for a second object for the same use. Each received
+object gets its OWN step that uses it.
 
 STEP 4 - YOUR OBJECTS FOR OTHERS. For each of YOUR "suggests" that the room where the task mainly
 happens would use, write a PASS offer to that room's robot.
@@ -131,7 +133,9 @@ OBJECT HANDOFFS (two ways, both decided by the other side):
   preparation is cancelled automatically).
 
 PHYSICAL RULES (simulator): a robot holds at most ONE object at a time. Write moving an object as
-ONE step with its destination, e.g. "move the Mug from the counter to the CoffeeTable". Fixed
+ONE step with its destination, e.g. "move the Mug from the counter to the CoffeeTable". Never group
+objects in one step with lists ("the A, B and C") or words like "all", "other", "remaining",
+"everything": write one step per object. Fixed
 furniture (beds, counters, sinks, bathtubs) cannot be moved. Do NOT write steps that only move,
 look, check, search or verify: robots cannot explore, travel is added automatically, and what other
 robots see is already in their offers.
@@ -203,7 +207,8 @@ If you accept or volunteer, you add ONE step to your own plan:
 
 OFFERS TO YOU: other robots offer objects (PASS). "receive" it if it helps ANY goal of the task (even a
 low-priority one) and still fits the deadline; a handoff costs only a few minutes. Say what you will do
-with it. "decline" only with a concrete reason. Receiving adds to your plan a RECEIVE and ONE step of
+with it. "decline" it if its purpose is already covered (by an object you have, one you requested, or
+one you are receiving in this answer, e.g. a second towel), or with another concrete reason. Receiving adds to your plan a RECEIVE and ONE step of
 yours that uses the object ("action", "uses", "duration", "insert_after").
 
 Return JSON:
