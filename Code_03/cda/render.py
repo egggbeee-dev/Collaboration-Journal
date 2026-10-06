@@ -17,6 +17,8 @@ def _line(g: PlanGraph, nid: str) -> str:
         body = f"{n.action} (help {n.target})" + (f" [+{n.travel}m travel to {n.location}]" if n.travel else "")
     elif n.type == PASS:
         body = f"pass {n.item} to {n.target}" + (" (offered)" if n.origin == "offer" else "")
+        if n.travel:
+            body += f" [+{n.travel}m to bring it to the {n.location}]"
     else:
         body = n.action
         serves = [g.nodes[e.dst].agent for e in g.collab_edges() if e.src == nid]
@@ -24,8 +26,8 @@ def _line(g: PlanGraph, nid: str) -> str:
             body += f" (also serves {', '.join(serves)}'s request)"
         if n.travel:
             body += f" [+{n.travel}m back to {n.location}]"
-    if n.type == RECEIVE and prov:
-        body += f" [door handoff {g.cfg.handoff_min}m]"
+    if n.type == RECEIVE and prov and n.travel:
+        body += f" [+{n.travel}m to fetch it in the {n.location}]"
     return f"- {n.agent} [{n.type}] {body}  ({nid})  → t={n.t_end}"
 
 
