@@ -151,8 +151,13 @@ async def edge_proposal(cfg: TaskConfig, plans: dict[str, list[Node]], offers: d
             uses, item, action = None, None, str(j.get("action", "") or "")
             if ptype == HELP:
                 uses = j.get("uses")
-                if not isinstance(uses, int) or not (0 <= uses < len(offers[agent].can_do)):
+                valid_uses = isinstance(uses, int) and 0 <= uses < len(offers[agent].can_do)
+                if req.basis == "carry" and not valid_uses:  # any mobile robot can carry what it can lift
+                    uses = None
+                elif not valid_uses:
                     problem = f"uses={uses} is not a valid can_do index"
+                if problem:
+                    pass
                 elif not me.profile.mobile and norm(req.location) != norm(me.profile.room):
                     problem = f"cannot leave {me.profile.room} to help in {req.location}"
                 elif req.basis == "carry" and agent in _carry_ends(req, by_id_all):
