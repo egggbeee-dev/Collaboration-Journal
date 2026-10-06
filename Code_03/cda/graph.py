@@ -516,9 +516,10 @@ class PlanGraph:
                 self.n_released += 1
 
     def schedule(self) -> None:
-        """Space-separated home. Every robot works in its own room; the only trips are HELP steps
-        (travel_min to get there) and the way back before the next step at home (travel_min).
-        Objects are handed over at the doors: RECEIVE ends handoff_min after its PASS, plus duration.
+        """Space-separated home. Every robot works in its own room. Trips (travel_min each way):
+        HELP steps; a MOBILE giver's PASS (it brings the object to the receiver's room); a RECEIVE from a
+        FIXED giver (the receiver fetches it from the giver's room); and the way back home before the
+        next step there. RECEIVE ends `duration` after both the object and the receiver are there.
         ASK_HELP ends when its helper ends."""
         g = self.nx()
         home = {a.id: a.profile.room for a in self.cfg.agents}
@@ -532,9 +533,16 @@ class PlanGraph:
                 place = n.location or cur[n.agent]
             elif n.type == ASK_HELP:
                 place = None                              # waiting at home
+            elif n.type == PASS and mobile[n.agent]:      # mobile giver brings it to the receiver
+                rcv = [self.nodes[e.dst] for e in self.collab.values() if e.src == nid and self.active(e.dst)]
+                place = home[rcv[0].agent] if rcv else home[n.agent]
+            elif n.type == RECEIVE and collab_preds and not mobile[self.nodes[collab_preds[0]].agent]:
+                place = home[self.nodes[collab_preds[0]].agent]   # fetch from the fixed giver's room
             else:
-                place = home[n.agent]                     # LOCAL / PASS / RECEIVE happen at home
+                place = home[n.agent]                     # LOCAL / PASS / RECEIVE at home
             n.travel = 0
+            if n.type in (PASS, RECEIVE):
+                n.location = place or n.location
             if place and norm(place) != norm(cur[n.agent]):
                 if mobile[n.agent]:
                     n.travel = self.cfg.travel_min
@@ -546,7 +554,7 @@ class PlanGraph:
             if n.type == ASK_HELP:
                 n.t_end = max([n.t_start] + [self.nodes[p].t_end for p in collab_preds])
             elif n.type == RECEIVE:
-                arrive = [self.nodes[p].t_end + self.cfg.handoff_min for p in collab_preds]
+                arrive = [self.nodes[p].t_end for p in collab_preds]
                 n.t_end = max([n.t_start + n.travel] + arrive) + n.duration
             else:
                 n.t_end = n.t_start + n.travel + n.duration
