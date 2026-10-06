@@ -37,7 +37,7 @@ Only then fill the fields.
 
 TEAM GOAL: the robots are a team. A well-prepared result is better than a minimal one. Do not invent
 work unrelated to the task, but DO use other rooms' objects and other robots' help whenever they
-make the result better or faster (e.g. water and a towel for a workout).
+make the result better (e.g. water and a towel for a workout).
 
 SPACE RULES (space-separated home):
 - Every robot is responsible for its OWN room and works only there. You never go to another room on
@@ -82,7 +82,7 @@ Nobody assigns you work, and you do not assign work to others.
 
 TEAM GOAL: the robots are a team. A well-prepared result is better than a minimal one. Do not invent
 work unrelated to the task, but DO use other rooms' objects and other robots' help whenever they
-make the result better or faster (e.g. water and a towel for a workout).
+make the result better (e.g. water and a towel for a workout).
 
 STEP 1 - GOALS. Write "goals": what must be true when the task is done, each with a priority
 (high / medium / low) taken from the task itself. Only goals of the TASK, not general housekeeping.
@@ -97,20 +97,14 @@ object just because you could finish without it.
 STEP 4 - YOUR OBJECTS FOR OTHERS. For each of YOUR "suggests" that the room where the task mainly
 happens would use, write a PASS offer to that room's robot.
 
-STEP 5 - TIME. Add up your steps. If your own room's work takes more than about 60% of the deadline,
-ask a mobile robot to do specific parts of it in parallel (e.g. "move the two light chairs to the
-wall"): write ASK_HELP with "basis": "time" (no "enables" needed) and do NOT also plan that part
-yourself. If nobody helps, you will do it yourself.
-
 If nothing needs you in your room, you need nothing, and you have nothing to offer, return an EMPTY
 "steps" list.
 
-STEP 6 - STEPS. Every step must serve one of YOUR goals: "serves" is the index of that goal.
+STEP 5 - STEPS. Every step must serve one of YOUR goals: "serves" is the index of that goal.
 Do high-priority goals first. Use only these step types:
 - LOCAL:    something you do yourself, in your own room. "uses": index of the can_do entry it relies on.
-- ASK_HELP: another robot must DO something in your room. Either "basis": "dependency" (it must happen
-            before one of YOUR later LOCAL steps; requires "enables") or "basis": "time" (parallel
-            help with part of your work, see STEP 5). Requires "target", "action".
+- ASK_HELP: another robot must DO something in your room that your body cannot do, before one of
+            YOUR OWN later LOCAL steps can happen. Requires "target", "action", "enables".
 - RECEIVE:  you need an OBJECT for one of YOUR OWN later LOCAL steps.
             Requires "target", "item" (copied exactly from the target's has_items), "enables".
 "enables" is the index (0-based, in your "steps" list) of YOUR OWN later LOCAL step that is
@@ -151,8 +145,7 @@ Return JSON:
  "steps": [
   {{"type": "RECEIVE", "item": "...", "target": "R1", "enables": 1, "serves": 0, "duration": 1}},
   {{"type": "LOCAL", "action": "move ... from ... to ...", "uses": 0, "serves": 0, "duration": 3}},
-  {{"type": "ASK_HELP", "basis": "dependency", "action": "move the heavy ... to ...", "target": "R2", "enables": 3, "serves": 1, "duration": 5}},
-  {{"type": "ASK_HELP", "basis": "time", "action": "move the two light chairs to the wall", "target": "R3", "serves": 0, "duration": 3}},
+  {{"type": "ASK_HELP", "action": "move the heavy ... to ...", "target": "R2", "enables": 3, "serves": 1, "duration": 5}},
   {{"type": "LOCAL", "action": "...", "uses": 1, "serves": 1, "duration": 2}},
   {{"type": "LOCAL", "action": "fill the Cup with water at the sink", "uses": 2, "serves": 1, "duration": 1}},
   {{"type": "PASS", "item": "Cup", "target": "R2", "prepared_by": 4, "serves": 1, "duration": 1}}
@@ -212,9 +205,6 @@ OFFERS TO YOU: other robots offer objects (PASS). "receive" it if it helps ANY g
 low-priority one) and still fits the deadline; a handoff costs only a few minutes. Say what you will do
 with it. "decline" only with a concrete reason. Receiving adds to your plan a RECEIVE and ONE step of
 yours that uses the object ("action", "uses", "duration", "insert_after").
-
-Some ASK_HELP requests have "basis": "time": the robot is short of time and asks for parallel help in
-its room. If you are mobile, have little to do, and your body can do it, accept.
 
 Return JSON:
 {{
