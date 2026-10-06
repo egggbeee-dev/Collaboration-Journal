@@ -9,7 +9,10 @@ def _line(g: PlanGraph, nid: str) -> str:
     n = g.nodes[nid]
     prov = g.providers_of(nid)
     partner = g.nodes[prov[0].src].agent if prov else None
-    if n.type == ASK_HELP:
+    if n.type == ASK_HELP and n.basis == "time":
+        body = (f"no helper came, does it itself: {n.action}" if n.fallback_self
+                else f"asks {partner} to help in parallel: {n.action}")
+    elif n.type == ASK_HELP:
         body = f"wait for {partner} to: {n.action}"
     elif n.type == RECEIVE:
         body = f"receive {n.item} from {partner}"
@@ -103,5 +106,9 @@ def metrics(g: PlanGraph, plan_meta: dict, llm_usage: dict) -> dict:
         "n_offers_taken": sum(1 for e in final_collab if g.nodes[e.src].origin == "offer"),
         "n_offers_untaken": g.n_offers_untaken,
         "n_preparations_released": g.n_prep_released,
+        "n_time_help_requests": sum(1 for n in nodes if n.type == "ASK_HELP" and n.basis == "time"),
+        "n_time_help_served": sum(1 for n in nodes if n.type == "ASK_HELP" and n.basis == "time"
+                                  and n.status == "active" and not n.fallback_self and g.providers_of(n.id)),
+        "n_time_help_self": sum(1 for n in nodes if n.type == "ASK_HELP" and n.fallback_self),
         **llm_usage,
     }
