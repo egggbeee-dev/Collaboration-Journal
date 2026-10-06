@@ -24,6 +24,8 @@ from .schemas import (ASK_HELP, LOCAL, PASS, RECEIVE, REQUEST_TYPES, Node, Offer
 # No exploration in this setting, and movement is added by the scheduler: steps that only look,
 # check or search for something do not change the world and are not allowed.
 _MOVE_ONLY = re.compile(r"^\s*(go|move|walk|head|travel|return|navigate|come)\s+(back\s+)?(to|into)\b", re.I)
+_NON_PHYSICAL = re.compile(r"^\s*(mark|coordinate|conduct|ensure|make sure|confirm|supervise|oversee|monitor|"
+                          r"designate|assess|evaluate|decide|plan|verify|review)\b", re.I)
 _OBSERVE = re.compile(r"\b(check|checks|checking|search|searching|look for|looking for|find|finding|"
                       r"inspect|verify|scan|locate|explore|availability)\b", re.I)
 
@@ -91,6 +93,10 @@ def validate(raw_steps: list[dict], agent: str, offers: dict[str, Offer], cfg: T
         if t == LOCAL and any(re.search(rf"\b{o}\b", step["action"], re.I) for o in others):
             v.append(f"LOCAL '{step['action']}' hands something to another robot. Do not plan handoffs: "
                      f"the receiver writes RECEIVE and you answer later with a PASS")
+        if t == LOCAL and _NON_PHYSICAL.search(step["action"]):
+            v.append(f"LOCAL '{step['action']}' is not a physical action. Write what your body does to an "
+                     f"object (move X from A to B, open, switch on, fill). If your body cannot do the real "
+                     f"work (e.g. heavy furniture), write ASK_HELP to a robot that can")
         if t in (LOCAL, ASK_HELP) and (_OBSERVE.search(step["action"]) or _MOVE_ONLY.search(step["action"])):
             v.append(f"{t} '{step['action']}' only looks/checks/searches. Robots cannot explore and "
                      f"movement is added automatically: write only steps that change the room "
@@ -182,7 +188,8 @@ async def make_local_plan(cfg: TaskConfig, agent: str, offers: dict[str, Offer],
         can_do_indexed=indexed(own.can_do),
         public_offers=_j([o.public() for o in offers.values()]),
         profiles=_j({a.id: {"room": a.profile.room, "mobile": a.profile.mobile,
-                            "payload_kg": a.profile.payload_kg} for a in cfg.agents}),
+                            **({"payload_kg": a.profile.payload_kg} if a.profile.payload_kg else {}),
+                            "embodiment": a.profile.embodiment} for a in cfg.agents}),
     )
     d = await llm.complete(system, user, key=f"plan:{agent}")
     steps, errors = validate(d.get("steps", []), agent, offers, cfg, d.get("goals") or [])
