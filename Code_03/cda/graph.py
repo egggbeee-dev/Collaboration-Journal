@@ -82,6 +82,8 @@ class PlanGraph:
         self.request_outcome: dict[str, str] = {}        # request id -> declined | failed | moot
         self._initial_nodes = set(self.nodes)
         self._agreements = {(self.nodes[e.src].agent, e.dst) for e in collab if e.status == CONFIRMED}
+        self.carry_edges: list[Edge] = []               # PASS -> carrier HELP -> RECEIVE (timing only)
+        self.n_carry_moot = 0
         self.ops_log: list[dict] = []
         self.drops: list[dict] = []
         self.unresolved: list[dict] = []
@@ -113,7 +115,8 @@ class PlanGraph:
                 if not only_active or (self.active(e.src) and self.active(e.dst))]
 
     def edges(self) -> list[Edge]:
-        return self.seq_edges() + self.collab_edges()
+        carry = [e for e in self.carry_edges if self.active(e.src) and self.active(e.dst)]
+        return self.seq_edges() + self.collab_edges() + carry
 
     def nx(self) -> nx.DiGraph:
         g = nx.DiGraph()
@@ -398,10 +401,11 @@ class PlanGraph:
                                       "similarity": iss["similarity"]})
         self._drop_unrequested_handoff_prep()
         self._pass_after_prep()
-        g = self.nx()
         roots: list[tuple[str, str]] = []             # (node id, cause)
+        roots += self._resolve_carriers()
+        g = self.nx()
         for rid, r in self.nodes.items():
-            if r.type in REQUEST_TYPES and self.active(rid) and not self.providers_of(rid):
+            if r.type in REQUEST_TYPES and self.active(rid) and not self.providers_of(rid) and r.basis != "carry":
                 reply = self.target_reply.get(rid, "")
                 declined = reply.startswith("reject") or reply.startswith("rejected_by_check")
                 cause = "declined" if declined else "failed"
@@ -455,13 +459,17 @@ class PlanGraph:
     _PREP = re.compile(r"\b(pick-?up|hand-?off|hand over|handover|collection|pass(ing)?|transfer|staging)\s+"
                        r"(area|spot|point|zone|station|location|position|place|counter|shelf)\b"
                        r"|\bfor (collection|pick-?up|hand-?off|hand-?over|delivery|transfer)\b"
-                       r"|\b(side of|by|near|beside|next to|at) the [a-z ]*door(way)?\b", re.I)
+                       r"|\b(side of|by|near|beside|next to|at) the (\w+ ){0,2}door(way)?\b", re.I)
 
     def _drop_unrequested_handoff_prep(self) -> None:
         """PASS already includes picking the object up. A LOCAL step that only stages an object at a
         pickup/handoff spot is either redundant (a PASS exists) or serves nobody: release it."""
         preps = {p.prepared_by for p in self.nodes.values() if p.type == PASS and p.status == "active"}
+        givers = {p.agent for p in self.nodes.values() if p.type == PASS}
+        receivers = {r.agent for r in self.nodes.values() if r.type == RECEIVE}
         for n in list(self.nodes.values()):
+            if n.agent in receivers and n.agent not in givers:   # pure receivers do not stage handoffs
+                continue
             if n.id in preps and is_real_preparation(n.action):   # real preparation of an offer: keep it
                 continue
             if n.status == "active" and n.type == LOCAL and self._PREP.search(n.action or ""):
@@ -471,6 +479,49 @@ class PlanGraph:
                     for p in self.nodes.values():
                         if p.type == PASS and p.prepared_by == n.id:
                             p.prepared_by = None
+
+    def _handoff_pair(self, c: Node) -> tuple[Node | None, Node | None]:
+        h = self.nodes.get(c.carry_for)
+        if h is None or not self.active(h.id):
+            return None, None
+        if h.type == PASS:
+            rcv = [self.nodes[e.dst] for e in self.collab.values() if e.src == h.id and self.active(e.dst)]
+            return h, (rcv[0] if rcv else None)
+        pas = [self.nodes[e.src] for e in self.collab.values() if e.dst == h.id and self.active(e.src)]
+        return (pas[0] if pas else None), h
+
+    def _resolve_carriers(self) -> list[tuple[str, str]]:
+        """Carry requests: if the handoff did not happen, the carrying is moot; if nobody carries, the
+        receiver cannot get the object (its RECEIVE is blocked); otherwise chain PASS -> carry -> RECEIVE."""
+        roots = []
+        for c in [n for n in self.nodes.values() if n.basis == "carry" and n.status == "active"]:
+            pas, rcv = self._handoff_pair(c)
+            helpers = [self.nodes[e.src] for e in self.providers_of(c.id)]
+            if pas is None or rcv is None:
+                c.status = "skipped"
+                self.request_outcome[c.id] = "moot"
+                self.n_carry_moot += 1
+                for h in helpers:
+                    h.status = "skipped"
+                    self.drops.append({"node": h.id, "agent": h.agent, "type": h.type, "text": h.text(),
+                                       "reason": f"carrying not needed: the handoff for {c.carry_for} did not happen",
+                                       "by": "rule"})
+                continue
+            if not helpers:
+                reply = self.target_reply.get(c.id, "")
+                cause = "declined" if reply.startswith("reject") else "failed"
+                self.request_outcome[c.id] = cause
+                self.unresolved.append({"request": c.id, "agent": c.agent, "text": c.text(), "outcome": cause,
+                                        "why": "no mobile robot carries the object", "by": "rule"})
+                c.status = "blocked"
+                c.violations = c.violations + [f"blocked ({cause})"]
+                if pas.status == "active":
+                    pas.status = "skipped"
+                roots.append((rcv.id, cause))
+                continue
+            h = helpers[0]
+            self.carry_edges += [Edge(pas.id, h.id, "CARRY"), Edge(h.id, rcv.id, "CARRY")]
+        return roots
 
     def _tighten_requests(self) -> None:
         """A request only has to be satisfied before the step it enables. If a robot wrote it earlier,
@@ -536,8 +587,6 @@ class PlanGraph:
             elif n.type == PASS and mobile[n.agent]:      # mobile giver brings it to the receiver
                 rcv = [self.nodes[e.dst] for e in self.collab.values() if e.src == nid and self.active(e.dst)]
                 place = home[rcv[0].agent] if rcv else home[n.agent]
-            elif n.type == RECEIVE and collab_preds and not mobile[self.nodes[collab_preds[0]].agent]:
-                place = home[self.nodes[collab_preds[0]].agent]   # fetch from the fixed giver's room
             else:
                 place = home[n.agent]                     # LOCAL / PASS / RECEIVE at home
             n.travel = 0
@@ -550,8 +599,13 @@ class PlanGraph:
                 else:
                     self.warnings.append({"issue": "immobile robot would have to move", "node": nid,
                                           "from": cur[n.agent], "to": place})
+            carry_preds = [p for p in g.predecessors(nid) if g.edges[p, nid]["kind"] == "CARRY"]
             n.t_start = max([self.nodes[p].t_end for p in seq_preds] or [0])
-            if n.type == ASK_HELP:
+            if n.type == HELP and carry_preds:                 # carrier waits for the handover
+                n.t_start = max([n.t_start] + [self.nodes[p].t_end for p in carry_preds])
+            if n.type == ASK_HELP and n.basis == "carry":
+                n.t_end = n.t_start                            # the owner does not wait for the carrier
+            elif n.type == ASK_HELP:
                 n.t_end = max([n.t_start] + [self.nodes[p].t_end for p in collab_preds])
             elif n.type == RECEIVE:
                 arrive = [self.nodes[p].t_end for p in collab_preds]
