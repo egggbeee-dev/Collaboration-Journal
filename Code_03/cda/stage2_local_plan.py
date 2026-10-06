@@ -96,7 +96,7 @@ def validate(raw_steps: list[dict], agent: str, offers: dict[str, Offer], cfg: T
         if t == LOCAL and _NON_PHYSICAL.search(step["action"]):
             v.append(f"LOCAL '{step['action']}' is not a physical action. Write what your body does to an "
                      f"object (move X from A to B, open, switch on, fill). If your body cannot do the real "
-                     f"work (e.g. heavy furniture), write ASK_HELP to a robot that can")
+                     f"work (e.g. heavy furniture), do NOT drop it: write ASK_HELP to a robot that can")
         if t in (LOCAL, ASK_HELP) and (_OBSERVE.search(step["action"]) or _MOVE_ONLY.search(step["action"])):
             v.append(f"{t} '{step['action']}' only looks/checks/searches. Robots cannot explore and "
                      f"movement is added automatically: write only steps that change the room "
@@ -178,6 +178,20 @@ def validate(raw_steps: list[dict], agent: str, offers: dict[str, Offer], cfg: T
     return cleaned, errors
 
 
+def coverage_advice(steps: list[dict], goals: list) -> list[str]:
+    """Essential goals in the robot's own room that no step serves (soft: only triggers the self-fix)."""
+    served = {st.get("serves") for st in steps if st.get("serves")}
+    out = []
+    for g in goals or []:
+        if not isinstance(g, dict):
+            continue
+        text = str(g.get("goal", ""))
+        if str(g.get("priority", "")).lower() == "high" and g.get("in_my_room") is True and text not in served:
+            out.append(f"ESSENTIAL goal '{text}' in your room has no step. Do it yourself, or if your body "
+                       f"cannot, write ASK_HELP to a robot whose body can. Do not leave essential work out.")
+    return out
+
+
 async def make_local_plan(cfg: TaskConfig, agent: str, offers: dict[str, Offer], llm: BaseLLM,
                           log: EventLog, max_fix: int = 1) -> tuple[list[Node], dict]:
     me = cfg.agent(agent)
@@ -193,6 +207,10 @@ async def make_local_plan(cfg: TaskConfig, agent: str, offers: dict[str, Offer],
     )
     d = await llm.complete(system, user, key=f"plan:{agent}")
     steps, errors = validate(d.get("steps", []), agent, offers, cfg, d.get("goals") or [])
+    gaps = coverage_advice(steps, d.get("goals") or [])
+    if gaps:
+        errors = errors + gaps
+        log.log("plan", agent, "essential_goal_uncovered", n=len(gaps))
     n_fix = 0
     while errors and n_fix < max_fix:
         n_fix += 1
