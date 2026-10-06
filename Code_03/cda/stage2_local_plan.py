@@ -93,6 +93,15 @@ def validate(raw_steps: list[dict], agent: str, offers: dict[str, Offer], cfg: T
             step["location"] = me.profile.room
         elif t in REQUEST_TYPES:
             step["uses"] = None
+            step["basis"] = "time" if t == ASK_HELP and str(s.get("basis", "")).lower() == "time" else "dependency"
+            if step["basis"] == "time":
+                step["location"] = me.profile.room
+                load = sum(snap_duration(x.get("duration", 2)) for x in (raw_steps or [])
+                           if str(x.get("type", "")).upper() == LOCAL
+                           or (str(x.get("type", "")).upper() == ASK_HELP and str(x.get("basis", "")).lower() == "time"))
+                if load < 0.6 * cfg.deadline_min:
+                    v.append(f"ASK_HELP '{step['action']}' asks for time reasons, but your room's work "
+                             f"({load} min) is well within the deadline ({cfg.deadline_min} min): do it yourself")
             tgt = step["target"]
             if tgt not in cfg.ids or tgt == agent:
                 v.append(f"{t} needs a target among {[x for x in cfg.ids if x != agent]}, got {tgt}")
@@ -122,12 +131,12 @@ def validate(raw_steps: list[dict], agent: str, offers: dict[str, Offer], cfg: T
         if step["type"] == PASS and pb is not None:
             if isinstance(pb, str) and pb.strip().isdigit():
                 pb = int(pb.strip())
-            if not isinstance(pb, int) or not (0 <= pb < i) or raw_types[pb] != LOCAL:
-                step["violations"].append(f"PASS 'prepared_by' must be the index of one of YOUR earlier LOCAL "
-                                          f"steps (got {pb})")
-                pb = None
+            if not isinstance(pb, int) or not (0 <= pb < len(raw_types)) or pb == i or raw_types[pb] != LOCAL:
+                pb = None                               # optional link: ignore a bad index, keep the offer
             step["prepared_by"] = pb
-        if step["type"] in REQUEST_TYPES:
+        if step["type"] in REQUEST_TYPES and step.get("basis") == "time":
+            step["enables"] = None
+        elif step["type"] in REQUEST_TYPES:
             e = step["enables"]
             if isinstance(e, str) and e.strip().isdigit():
                 e = int(e.strip())
@@ -173,7 +182,7 @@ async def make_local_plan(cfg: TaskConfig, agent: str, offers: dict[str, Offer],
     nodes = [Node(id=f"r{n}_s{k}", agent=agent, type=s["type"], action=s["action"], item=s["item"],
                   target=s["target"], uses=s["uses"], location=s["location"], duration=s["duration"],
                   origin="offer" if s["type"] == PASS else "local", violations=s["violations"],
-                  serves=s.get("serves"))
+                  serves=s.get("serves"), basis=s.get("basis", "dependency"))
              for k, s in enumerate(steps, start=1)]
     raw_to_id = {s["_raw_index"]: nodes[k].id for k, s in enumerate(steps)}
     for s, node in zip(steps, nodes):
@@ -185,7 +194,7 @@ async def make_local_plan(cfg: TaskConfig, agent: str, offers: dict[str, Offer],
         if node.type == PASS and node.violations:          # invalid offer: withdrawn before broadcast
             node.status = "dropped"
             log.log("plan", agent, "offer_withdrawn", node=node.id)
-        if node.type in REQUEST_TYPES and node.enables is None:
+        if node.type in REQUEST_TYPES and node.enables is None and node.basis != "time":
             node.status = "dropped"
             log.log("plan", agent, "request_withdrawn", node=node.id)
     log.log("plan", agent, "broadcast_requests", steps=len(nodes),
