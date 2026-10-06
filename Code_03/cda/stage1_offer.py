@@ -28,7 +28,9 @@ def _as_list(x) -> list[str]:
 
 async def make_offer(cfg: TaskConfig, a: AgentInput, llm: BaseLLM, log: EventLog) -> Offer:
     user = OFFER_USER.format(task=cfg.task, deadline=cfg.deadline_min, room=a.profile.room,
-                             mobile=a.profile.mobile, payload=a.profile.payload_kg,
+                             mobile=a.profile.mobile,
+                             payload=(f"{a.profile.payload_kg:g} kg" if a.profile.payload_kg
+                                      else "not specified (judge from your embodiment)"),
                              embodiment=a.profile.embodiment,
                              instruction=a.instruction or "(none)", n_img=len(a.images))
     d = await llm.complete(OFFER_SYSTEM.format(agent=a.id), user, key=f"offer:{a.id}", images=a.images)
