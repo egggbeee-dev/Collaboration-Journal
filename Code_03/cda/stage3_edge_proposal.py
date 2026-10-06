@@ -161,6 +161,8 @@ async def edge_proposal(cfg: TaskConfig, plans: dict[str, list[Node]], offers: d
                     continue
                 if stock[agent][norm(item)] <= 0:
                     problem = f"item '{item}' not available (not in has_items or already promised)"
+                elif not me.profile.mobile and not cfg.agent(req.agent).profile.mobile:
+                    problem = "both robots are fixed: nobody can carry the object between the rooms"
                 action = action or f"pass {item} to {req.agent}"
                 location = me.profile.room          # handed over at the room door
             if problem:
@@ -202,6 +204,10 @@ async def edge_proposal(cfg: TaskConfig, plans: dict[str, list[Node]], offers: d
                 continue
             if linked(oid):
                 rec["result"] = "already_linked (you requested it)"
+                record.append(rec)
+                continue
+            if not cfg.agent(agent).profile.mobile and not cfg.agent(p.agent).profile.mobile:
+                rec["result"] = "rejected_by_check: both robots are fixed: nobody can carry the object"
                 record.append(rec)
                 continue
             uses = oj.get("uses")
