@@ -28,6 +28,18 @@ _OBSERVE = re.compile(r"\b(check|checks|checking|search|searching|look for|looki
                       r"inspect|verify|scan|locate|explore|availability)\b", re.I)
 
 
+def _carrier(s: dict, giver: str, receiver: str, cfg: TaskConfig, v: list[str]) -> str | None:
+    """A fixed robot cannot move objects between rooms: a mobile robot (not the giver, not the receiver,
+    who both stay in their rooms) must carry it."""
+    c = str(s.get("carrier") or "").strip().upper()
+    ok = [a.id for a in cfg.agents if a.profile.mobile and a.id not in (giver, receiver)]
+    if c not in ok:
+        v.append(f"{giver} is fixed and cannot send objects to another room, and {receiver} stays in its room: "
+                 f"name a mobile robot to carry it in \"carrier\" (one of {ok}), got {c or None}")
+        return None
+    return c
+
+
 def validate(raw_steps: list[dict], agent: str, offers: dict[str, Offer], cfg: TaskConfig,
              goals: list | None = None) -> tuple[list[dict], list[str]]:
     """Return cleaned step dicts (each with a 'violations' list) and readable error strings.
@@ -58,6 +70,7 @@ def validate(raw_steps: list[dict], agent: str, offers: dict[str, Offer], cfg: T
             if not step["item"] or norm(step["item"]) not in {norm(x) for x in own.has_items}:
                 v.append(f"PASS item '{step['item']}' must be copied from YOUR has_items")
             step["action"] = step["action"] or f"pass {step['item']} to {step['target']}"
+            step["carrier"] = _carrier(s, agent, step["target"], cfg, v) if not me.profile.mobile else None
 
         if goals is not None:
             sv = s.get("serves")
@@ -102,6 +115,9 @@ def validate(raw_steps: list[dict], agent: str, offers: dict[str, Offer], cfg: T
                 v.append("ASK_HELP needs an action")
             if t == RECEIVE:
                 step["location"] = me.profile.room
+                giver = cfg.agent(step["target"]) if step["target"] in cfg.ids else None
+                step["carrier"] = _carrier(s, step["target"], agent, cfg, v) \
+                    if giver is not None and not giver.profile.mobile else None
                 if not step["item"]:
                     v.append("RECEIVE needs an item")
                 elif step["target"] in offers and norm(step["item"]) not in \
@@ -191,13 +207,28 @@ async def make_local_plan(cfg: TaskConfig, agent: str, offers: dict[str, Offer],
             node.enables = raw_to_id.get(s["enables"])
         if s.get("prepared_by") is not None:
             node.prepared_by = raw_to_id.get(s["prepared_by"])
-        # a request that is not a dependency of own work is withdrawn before broadcast
         if node.type == PASS and node.violations:          # invalid offer: withdrawn before broadcast
             node.status = "dropped"
             log.log("plan", agent, "offer_withdrawn", node=node.id)
+        # a request that is not a dependency of own work is withdrawn before broadcast
         if node.type in REQUEST_TYPES and node.enables is None:
             node.status = "dropped"
             log.log("plan", agent, "request_withdrawn", node=node.id)
+    # carry requests: owned by whoever started the handoff, asked of the named mobile carrier
+    k = len(nodes)
+    for s, node in list(zip(steps, nodes)):
+        c = s.get("carrier")
+        if not c or node.status != "active":
+            continue
+        giver = agent if node.type == PASS else node.target
+        receiver = node.target if node.type == PASS else agent
+        k += 1
+        nodes.append(Node(id=f"r{n}_s{k}", agent=agent, type=ASK_HELP, basis="carry", carry_for=node.id,
+                          target=c, item=node.item, location=cfg.agent(giver).profile.room, duration=1,
+                          action=f"carry the {node.item} from the {cfg.agent(giver).profile.room} ({giver}) "
+                                 f"to {receiver} in the {cfg.agent(receiver).profile.room}",
+                          origin="local", serves=node.serves))
+        log.log("plan", agent, "carry_request", node=nodes[-1].id, carrier=c, item=node.item)
     log.log("plan", agent, "broadcast_requests", steps=len(nodes),
             requests=sum(x.type in REQUEST_TYPES and x.status == "active" for x in nodes),
             violations=sum(bool(x.violations) for x in nodes))
