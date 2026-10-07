@@ -4,12 +4,16 @@ Nodes = steps. Edges = "src must finish before dst can finish".
     SEQ       consecutive active steps of the same robot (derived from each robot's order list)
     TRANSFER  PASS -> RECEIVE
     HELP      HELP -> ASK_HELP
+    ORDER     added here: an existing step must finish before another robot's step starts
+              (same space / same object), decided by the Graph LLM on code-given candidates
+
+Collaboration edges arrive from Stage 3 as CANDIDATES (PROPOSED). Here they are confirmed:
+    one candidate for a request -> rule confirms it
+    several (or another robot's existing work could cover it) -> the Graph LLM selects one
 
 Invariants (asserted in `check_invariants`):
     1. no step is ever created here
-    2. every CONFIRMED agreement (robot X agreed to serve request r) still holds at the end:
-       r is served by an undropped step of X through a CONFIRMED edge. ("merge" may move the
-       agreement to another step of the SAME robot that does the same work; nothing else may touch it.)
+    2. every agreement CONFIRMED here (rule or graph) still holds at the end.
 """
 from __future__ import annotations
 
@@ -18,8 +22,8 @@ import re
 
 import networkx as nx
 
-from .schemas import (ASK_HELP, CONFIRMED, HELP, LOCAL, PASS, PHASE_MIN, PROPOSED, PROVIDER_TYPES,
-                      RECEIVE, REQUEST_TYPES, SEQ, Edge, Node, Offer, TaskConfig, norm)
+from .schemas import (ASK_HELP, CONFIRMED, HELP, HELP_EDGE, LOCAL, ORDER, PASS, PHASE_MIN, PROPOSED,
+                      PROVIDER_TYPES, RECEIVE, REQUEST_TYPES, SEQ, Edge, Node, Offer, TaskConfig, norm)
 
 _STOP = set("a an the to of on in at into onto from for with and or by it its them their this that "
             "your my our be is are up down near next robot".split())
@@ -101,7 +105,14 @@ class PlanGraph:
         self.n_prep_released = 0
         self.request_outcome: dict[str, str] = {}        # request id -> declined | failed | moot
         self._initial_nodes = set(self.nodes)
-        self._agreements = {(self.nodes[e.src].agent, e.dst) for e in collab if e.status == CONFIRMED}
+        self._agreements: set[tuple[str, str]] = set()       # (provider agent, request id), confirmed here
+        self.n_candidates = len(collab)
+        self.order_edges: list[Edge] = []                    # ORDER edges added by the Graph LLM
+        self.dismissed_orders: set[frozenset] = set()        # pairs the Graph LLM judged independent
+        self.n_order_added = 0
+        self.n_order_independent = 0
+        self.size_source = None
+        self.n_size_missing = 0
         self.ops_log: list[dict] = []
         self.drops: list[dict] = []
         self.unresolved: list[dict] = []
@@ -133,7 +144,8 @@ class PlanGraph:
                 if not only_active or (self.active(e.src) and self.active(e.dst))]
 
     def edges(self) -> list[Edge]:
-        return self.seq_edges() + self.collab_edges()
+        order = [e for e in self.order_edges if self.active(e.src) and self.active(e.dst)]
+        return self.seq_edges() + self.collab_edges() + order
 
     def nx(self) -> nx.DiGraph:
         g = nx.DiGraph()
@@ -147,6 +159,36 @@ class PlanGraph:
 
     def has_confirmed(self, nid: str) -> bool:
         return any(e.status == CONFIRMED and nid in e.key for e in self.collab.values())
+
+    # ------------------------------------------------------------ confirming candidates
+    def confirm(self, e: Edge, by: str) -> None:
+        e.status = CONFIRMED
+        e.source = by
+        self._agreements.add((self.nodes[e.src].agent, e.dst))
+        (self.selected_by_graph if by == "graph" else self.selected_by_rule).add(e.dst)
+
+    def release(self, e: Edge, reason: str, by: str) -> str | None:
+        """A candidate that was not selected. A provider step that exists only for this answer
+        (accept / volunteer) is dropped; a step the robot does anyway (already_doing, own offer that
+        still serves something) only loses this edge."""
+        if e.status == CONFIRMED:
+            return "CONFIRMED edges cannot be released"
+        p = self.nodes[e.src]
+        self.collab.pop(e.key, None)
+        if p.origin in ("accept", "volunteer") and not any(x.src == p.id for x in self.collab.values()):
+            return self.drop(p.id, reason, by)
+        return None
+
+    def existing_work(self, r: Node) -> list[str]:
+        """Another robot's existing LOCAL/HELP step in the requester's room that acts on the same
+        object as an ASK_HELP (it may already do what is asked)."""
+        if r.type != ASK_HELP:
+            return []
+        linked = {e.src for e in self.collab.values() if e.dst == r.id}
+        return [n.id for n in self.nodes.values()
+                if n.status == "active" and n.type in WORK_TYPES and n.agent != r.agent
+                and n.id not in linked and norm(n.location) == norm(r.location)
+                and same_object(n.action, r.action) is True]
 
     # ------------------------------------------------------------ primitive mutations
     def enabling_requests(self, nid: str) -> list[Node]:
@@ -267,12 +309,13 @@ class PlanGraph:
             if r.type not in REQUEST_TYPES or not self.active(rid):
                 continue
             provs = self.providers_of(rid)
-            if any(e.status == CONFIRMED for e in provs):
+            conf = [e for e in provs if e.status == CONFIRMED]
+            if conf:
                 for e in provs:
                     if e.status == PROPOSED:
-                        self.drop(e.src, "target robot accepted the request", "rule")
-            elif len(provs) == 1 and rid not in self.selected_by_graph:
-                self.selected_by_rule.add(rid)
+                        self.release(e, f"{self.nodes[conf[0].src].agent} was selected for {rid}", "rule")
+            elif len(provs) == 1 and not self.existing_work(r):
+                self.confirm(provs[0], "rule")              # a single candidate: nothing to choose
 
     def detect_issues(self) -> list[dict]:
         issues: list[dict] = []
@@ -281,11 +324,14 @@ class PlanGraph:
             if r.type not in REQUEST_TYPES or not self.active(rid):
                 continue
             provs = self.providers_of(rid)
-            if len(provs) >= 2:
-                issues.append({"id": f"I{next(cid)}", "issue": "MULTIPLE_VOLUNTEERS",
+            existing = self.existing_work(r) if not any(e.status == CONFIRMED for e in provs) else []
+            if not any(e.status == CONFIRMED for e in provs) and (len(provs) >= 2 or (provs and existing)):
+                issues.append({"id": f"I{next(cid)}", "issue": "MULTIPLE_CANDIDATES",
                                "request": r.brief() | {"location": r.location},
-                               "target_reply": "rejected or no answer",
-                               "candidates": [self._cand(e) for e in provs]})
+                               "candidates": [self._cand(e) for e in provs]
+                               + [self.nodes[x].brief() | {"existing_work": True,
+                                                           "location": self.nodes[x].location}
+                                  for x in existing]})
             elif len(provs) == 1 and r.type == RECEIVE:
                 e = provs[0]
                 p = self.nodes[e.src]
@@ -301,7 +347,7 @@ class PlanGraph:
                 continue           # a robot's own planned steps are intentional (e.g. two different chairs)
             sx = {e.dst for e in self.collab.values() if e.src == x.id}
             sy = {e.dst for e in self.collab.values() if e.src == y.id}
-            if sx & sy:            # competing answers to one request -> MULTIPLE_VOLUNTEERS handles it
+            if sx & sy:            # competing answers to one request -> MULTIPLE_CANDIDATES handles it
                 continue
             if x.agent == y.agent and sx and sy:
                 continue           # one robot answering two different requests: two different jobs
@@ -317,6 +363,7 @@ class PlanGraph:
                                "nodes": [self._work_view(x), self._work_view(y)],
                                "same_robot": x.agent == y.agent})
         g = self.nx()
+        issues += self._order_candidates(g, cid)
         for cyc in itertools.islice(nx.simple_cycles(g), 5):
             pairs = list(zip(cyc, cyc[1:] + cyc[:1]))
             issues.append({
@@ -328,6 +375,40 @@ class PlanGraph:
                             for i in cyc if self.nodes[i].type in PROVIDER_TYPES],
             })
         return issues
+
+    def plan_view(self) -> dict:
+        """Compact joint plan for the Graph LLM: each robot's active steps in its own order."""
+        return {a: [self.nodes[i].brief() for i in ids if self.active(i)] for a, ids in self.order.items()}
+
+    def _order_candidates(self, g, cid, limit: int = 12) -> list[dict]:
+        """Pairs of steps of DIFFERENT robots in the same room that touch a shared object and have no
+        order between them yet (e.g. R4 moves the coffee table while R2 clears what is on it).
+        Only confirmed HELP steps are paired; the Graph LLM decides 'A before B' or 'independent'."""
+        out = []
+        helps = [self.nodes[e.src] for e in self.collab.values()
+                 if e.status == CONFIRMED and e.kind == HELP_EDGE and self.active(e.src) and self.active(e.dst)
+                 and self.nodes[e.src].type == HELP]
+        others = [n for n in self.nodes.values() if n.status == "active" and n.type in WORK_TYPES]
+        seen = set()
+        for h in helps:
+            for s in others:
+                pair = frozenset((h.id, s.id))
+                if s.agent == h.agent or pair in seen or pair in self.dismissed_orders:
+                    continue
+                if norm(s.location) != norm(h.location):
+                    continue
+                shared = (object_of(h.action) & _tokens(s.action)) | (object_of(s.action) & _tokens(h.action))
+                if not shared:
+                    continue
+                if nx.has_path(g, h.id, s.id) or nx.has_path(g, s.id, h.id):
+                    continue
+                seen.add(pair)
+                out.append({"id": f"I{next(cid)}", "issue": "ORDER_CANDIDATE",
+                            "steps": [h.brief() | {"location": h.location}, s.brief() | {"location": s.location}],
+                            "shared": sorted(shared)})
+                if len(out) >= limit:
+                    return out
+        return out
 
     def _work_view(self, n: Node) -> dict:
         serves = [{"request": e.dst, "edge": e.status} for e in self.collab.values() if e.src == n.id]
@@ -343,38 +424,59 @@ class PlanGraph:
     def _cand(self, e: Edge) -> dict:
         p = self.nodes[e.src]
         off = self.offers.get(p.agent)
-        return p.brief() | {"edge": e.status, "capability": off.capability if off else "",
+        return p.brief() | {"targeted": e.targeted, "capability": off.capability if off else "",
+                            "own_plan_length": sum(1 for x in self.order[p.agent] if self.active(x)),
                             "reason": self.reasons.get((e.src, e.dst), "")}
 
     # ------------------------------------------------------------ 4c/4d: LLM ops
     def apply_op(self, op: dict, issues: list[dict]) -> str | None:
         op = normalize_op(op)
         kind = op.get("op")
-        by_req = {i["request"]["id"]: i for i in issues if i["issue"] == "MULTIPLE_VOLUNTEERS"}
+        by_req = {i["request"]["id"]: i for i in issues if i["issue"] == "MULTIPLE_CANDIDATES"}
         mentioned = _ids_in(issues)
         if kind == "connect":
             src, dst = op.get("src"), op.get("dst")
             iss = by_req.get(dst)
             if iss is None:
-                return "connect only allowed on a MULTIPLE_VOLUNTEERS request"
-            cands = {c["id"] for c in iss["candidates"]}
+                return "connect only allowed on a MULTIPLE_CANDIDATES request"
+            cands = {c["id"]: c for c in iss["candidates"]}
             if src not in cands:
                 return f"src must be one of the candidates {sorted(cands)}"
-            for c in cands - {src}:
-                err = self.drop(c, f"graph chose {src} for {dst}", "graph")
+            if cands[src].get("existing_work"):        # another robot's existing step already does it
+                e = Edge(src, dst, HELP_EDGE, PROPOSED, "graph")
+                self.collab[e.key] = e
+            for e in [e for e in self.providers_of(dst) if e.src != src]:
+                err = self.release(e, f"graph selected {src} for {dst}", "graph")
                 if err:
                     return err
-            self.collab[(src, dst)].source = "graph"
-            self.selected_by_graph.add(dst)
+            self.confirm(self.collab[(src, dst)], "graph")
             return None
         if kind == "disconnect":
             k = (op.get("src"), op.get("dst"))
             e = self.collab.get(k)
             if e is None or k[0] not in mentioned:
                 return "edge not found among the issues"
-            if e.status == CONFIRMED:
-                return "CONFIRMED edges cannot be removed"
-            return self.drop(k[0], "graph disconnected: " + str(op.get("why", "")), "graph")
+            return self.release(e, "graph disconnected: " + str(op.get("why", "")), "graph")
+        if kind == "order":
+            a, b = op.get("before"), op.get("after")
+            iss = next((i for i in issues if i["issue"] == "ORDER_CANDIDATE"
+                        and {a, b} == {x["id"] for x in i["steps"]}), None)
+            if iss is None:
+                return "order only allowed on an ORDER_CANDIDATE pair"
+            e = Edge(a, b, ORDER, CONFIRMED, "graph")
+            self.order_edges.append(e)
+            if not nx.is_directed_acyclic_graph(self.nx()):
+                self.order_edges.remove(e)
+                return "this order would create a cycle"
+            self.n_order_added += 1
+            return None
+        if kind == "independent":
+            iss = next((i for i in issues if i["id"] == op.get("issue")), None)
+            if iss is None or iss["issue"] != "ORDER_CANDIDATE":
+                return "independent only allowed on an ORDER_CANDIDATE issue"
+            self.dismissed_orders.add(frozenset(x["id"] for x in iss["steps"]))
+            self.n_order_independent += 1
+            return None
         if kind == "move":
             nid = op.get("node")
             if nid not in mentioned:
@@ -407,14 +509,22 @@ class PlanGraph:
     # ------------------------------------------------------------ 4e: finalize + schedule
     def finalize(self) -> None:
         """Release leftover ambiguity, block what cannot run, then schedule."""
-        for rid, r in self.nodes.items():           # still >1 volunteer -> ambiguous, release all
-            if r.type in REQUEST_TYPES and self.active(rid):
-                provs = self.providers_of(rid)
-                if len(provs) >= 2:
-                    for e in provs:
-                        self.drop(e.src, "ambiguous volunteers left unresolved", "rule")
-                    self.unresolved.append({"request": rid, "why": "multiple volunteers, no choice",
-                                            "by": "rule"})
+        for rid, r in self.nodes.items():           # candidates the graph did not settle
+            if r.type not in REQUEST_TYPES or not self.active(rid):
+                continue
+            provs = self.providers_of(rid)
+            if not provs or any(e.status == CONFIRMED for e in provs):
+                continue
+            pick = [e for e in provs if e.targeted] if len(provs) >= 2 else provs
+            if len(pick) == 1:                                     # fallback: the robot that was asked
+                for e in provs:
+                    if e is not pick[0]:
+                        self.release(e, f"{self.nodes[pick[0].src].agent} was asked directly", "rule")
+                self.confirm(pick[0], "rule")
+            else:
+                for e in provs:
+                    self.release(e, "ambiguous candidates left unresolved", "rule")
+                self.unresolved.append({"request": rid, "why": "multiple candidates, no choice", "by": "rule"})
         self._tighten_requests()
         self._release_redundant_branches()
         for iss in self.detect_issues():
@@ -546,14 +656,14 @@ class PlanGraph:
 
     def schedule(self) -> None:
         """Logical time: every step takes one unit; no minutes, no travel time.
-        A step starts when the robot's previous step is done (SEQ) and, for a RECEIVE / HELP-waiting
+        A step starts when the robot's previous step (SEQ) and any ORDER predecessor are done and, for a RECEIVE / HELP-waiting
         ASK_HELP, when the other robot's provider step is done. ASK_HELP is pure waiting: it ends
         when its HELP ends and takes no unit of its own."""
         g = self.nx()
         for nid in nx.topological_sort(g):
             n = self.nodes[nid]
-            seq_preds = [p for p in g.predecessors(nid) if g.edges[p, nid]["kind"] == SEQ]
-            collab_preds = [p for p in g.predecessors(nid) if g.edges[p, nid]["kind"] != SEQ]
+            seq_preds = [p for p in g.predecessors(nid) if g.edges[p, nid]["kind"] in (SEQ, ORDER)]
+            collab_preds = [p for p in g.predecessors(nid) if g.edges[p, nid]["kind"] not in (SEQ, ORDER)]
             ready = max([self.nodes[p].t_end for p in seq_preds] or [0])
             given = max([self.nodes[p].t_end for p in collab_preds] or [0])
             if n.type == ASK_HELP:
@@ -567,57 +677,72 @@ class PlanGraph:
                 n.t_end = n.t_start + 1
 
     # ------------------------------------------------------------ 4f: 5-minute phases
+    SIZE_UNITS = {"short": 1, "medium": 2, "long": 4}     # coarse duration classes (~minutes)
+
     def n_phases(self) -> int:
         return max(1, -(-self.cfg.deadline_min // PHASE_MIN))
 
-    def phase_view(self) -> list[dict]:
-        """What the phase planner sees: every active step in logical order with what it waits for."""
-        g = self.nx()
+    def size_view(self) -> list[dict]:
+        """What the size judge sees: every active step (except ASK_HELP, which is only waiting)."""
         out = []
-        for nid in sorted(g.nodes, key=lambda i: (self.nodes[i].t_start, self.nodes[i].agent, i)):
+        for nid in sorted((i for i in self.nodes if self.active(i)),
+                          key=lambda i: (self.nodes[i].t_start, self.nodes[i].agent, i)):
             n = self.nodes[nid]
-            d = n.brief() | {"order": n.t_start, "after": sorted(g.predecessors(nid))}
+            if n.type == ASK_HELP:
+                continue
+            d = n.brief()
             if n.type == HELP:
-                d["in_room"] = n.location
+                d["goes_to"] = n.location
+            elif n.type == PASS and self.cfg.mover(n.agent, n.target) == n.agent:
+                d["brings_it_to"] = self.cfg.agent(n.target).profile.room
+            elif n.type == RECEIVE:
+                giver = self.providers_of(n.id)
+                if giver and self.cfg.mover(self.nodes[giver[0].src].agent, n.agent) == n.agent:
+                    d["collects_it_from"] = self.cfg.agent(self.nodes[giver[0].src].agent).profile.room
             out.append(d)
         return out
 
-    def assign_phases(self, proposed: dict | None, steps_per_phase: int = 3) -> None:
-        """Place every active step in a 5-minute phase.
-        `proposed` = {node id: phase} from the Graph LLM (None -> rule fallback: `steps_per_phase`
-        logical steps per phase). Code then enforces, in topological order:
-          - a step is never in an earlier phase than any step it depends on (same phase is fine:
-            the order inside a phase follows the logical order),
-          - ASK_HELP is waiting, so it sits in the phase where its helper finishes."""
+    def _default_size(self, n: Node) -> str:
+        if n.type == HELP:
+            return "medium"
+        if n.type == RECEIVE and self.providers_of(n.id) and \
+                self.cfg.mover(self.nodes[self.providers_of(n.id)[0].src].agent, n.agent) == n.agent:
+            return "medium"
+        if n.type == PASS and self.cfg.mover(n.agent, n.target) == n.agent:
+            return "medium"
+        return "short"
+
+    def assign_phases(self, sizes: dict | None) -> None:
+        """Place steps in 5-minute phases, deterministically.
+        `sizes` = {node id: short|medium|long} judged by the Graph LLM (None -> defaults by type).
+        Each size is a coarse duration class (short=1, medium=2, long=4 units of ~1 min). Walking the
+        graph in dependency order, a step starts when all its predecessors (own previous step, ORDER,
+        the object / help it waits for) have ended; its phase is the 5-minute window it ends in.
+        ASK_HELP is waiting: it ends when its helper ends and takes no time of its own."""
         g = self.nx()
-        self.phase_source = "graph_llm" if proposed else "rule"
-        self.n_phase_fixed = 0
-        self.n_phase_missing = 0
+        self.size_source = "graph_llm" if sizes else "rule"
+        self.n_size_missing = 0
+        end: dict[str, float] = {}
         for nid in nx.topological_sort(g):
             n = self.nodes[nid]
-            need = max([self.nodes[p].phase for p in g.predecessors(nid)] or [1])
-            fallback = n.t_start // steps_per_phase + 1
-            want = None
-            if proposed:
-                v = proposed.get(nid)
-                try:
-                    want = int(v)
-                except (TypeError, ValueError):
-                    self.n_phase_missing += 1
-            if want is None:
-                want = max(fallback, need)
+            start = max([end[p] for p in g.predecessors(nid)] or [0])
             if n.type == ASK_HELP:
-                want = need
-            elif want < need:
-                self.n_phase_fixed += 1
-                want = need
-            n.phase = max(1, want)
+                u = 0
+            else:
+                size = str((sizes or {}).get(nid, "")).lower().strip()
+                if size not in self.SIZE_UNITS:
+                    if sizes:
+                        self.n_size_missing += 1
+                    size = self._default_size(n)
+                n.size = size
+                u = self.SIZE_UNITS[size]
+            end[nid] = start + u
+            n.phase = max(1, -(-int(end[nid]) // PHASE_MIN))
 
     def makespan_min(self) -> int:
         ph = [n.phase for n in self.nodes.values() if n.status == "active" and n.phase]
         return max(ph or [0]) * PHASE_MIN
 
-    # ------------------------------------------------------------ checks / export
     def check_invariants(self) -> None:
         assert set(self.nodes) <= self._initial_nodes, "graph stage created a step"
         for agent, rid in self._agreements:
@@ -639,7 +764,7 @@ class PlanGraph:
 
 
 _OP_KEYS = ("op", "operation", "type", "action", "decision")
-_OP_NAMES = {"connect", "disconnect", "move", "drop", "merge", "unresolved"}
+_OP_NAMES = {"connect", "disconnect", "move", "drop", "merge", "unresolved", "order", "independent"}
 
 
 def normalize_op(op) -> dict:
@@ -668,7 +793,7 @@ def _ids_in(obj) -> set[str]:
     out: set[str] = set()
     if isinstance(obj, dict):
         for k, v in obj.items():
-            if k in ("id", "src", "dst", "node") and isinstance(v, str):
+            if k in ("id", "src", "dst", "node", "before", "after") and isinstance(v, str):
                 out.add(v)
             out |= _ids_in(v)
     elif isinstance(obj, list):
