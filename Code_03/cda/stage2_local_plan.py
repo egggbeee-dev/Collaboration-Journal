@@ -6,7 +6,11 @@ Code then checks every step against the robot's own Offer and profile:
 - RECEIVE item must appear in the target's has_items.
 - Every request must name in "enables" an own LATER LOCAL step that depends on it.
   (A request is a dependency of the robot's own work, not a way to hand out parts of the task.)
-On violations the robot gets ONE chance to fix its own plan (still decentralized).
+- Every entry of the robot's own "checklist" (objects that must change) needs a step that names it;
+  a heavy object marked LOCAL by a light-duty body, or a step that assumes another object was moved
+  first with no step moving it, is a violation.
+On violations the robot gets up to TWO chances to fix its own plan (still decentralized). Essential
+goals / checklist entries still uncovered after that are reported in the Joint Plan.
 Remaining violations: requests are withdrawn before broadcast (never seen by others);
 LOCAL steps with violations are dropped in Stage 4.
 """
@@ -14,6 +18,7 @@ from __future__ import annotations
 
 import re
 
+from .graph import _tokens, object_of
 from .llm import BaseLLM
 from .log import EventLog
 from .prompts import PLAN_FIX, PLAN_USER, _j, indexed, plan_system
@@ -28,6 +33,61 @@ _NON_PHYSICAL = re.compile(r"^\s*(mark|coordinate|conduct|ensure|make sure|confi
                           r"designate|assess|evaluate|decide|plan|verify|review)\b", re.I)
 _OBSERVE = re.compile(r"\b(check|checks|checking|search|searching|look for|looking for|find|finding|"
                       r"inspect|verify|scan|locate|explore|availability)\b", re.I)
+
+
+# "roll the rug after the Glass coffee table has been removed" -> "Glass coffee table"
+_AFTER = re.compile(r"\b(?:after|once|when|now that)\s+(?:the\s+)?(.+?)\s+(?:has|have|is|are)\s+(?:been\s+)?"
+                    r"(?:removed|moved|cleared|relocated|taken away|pushed|put away|out of the way)", re.I)
+_LIGHT_BODY = re.compile(r"cannot (?:move|carry|lift) heavy|light[- ]duty|only (?:carry|lift|move) light", re.I)
+COVER = 0.6          # share of an object's words a step must mention to count as handling it
+
+
+def _cover(obj: set, text: str) -> float:
+    return len(obj & _tokens(text)) / len(obj) if obj else 0.0
+
+
+def _handled(st: dict) -> set:
+    """Words of the object a step acts on (not of objects it merely mentions, e.g. in 'after ...')."""
+    if st["type"] == RECEIVE:
+        return _tokens(st.get("item") or "")
+    action = _AFTER.sub("", st.get("action", ""))
+    return object_of(action) or _tokens(action)
+
+
+def checklist_advice(steps: list[dict], checklist: list, embodiment: str) -> tuple[list[str], list[str]]:
+    """Each checklist entry must be handled by its own step (one step per entry, matched by the
+    object's words). Returns (errors, uncovered entries)."""
+    items = [c for c in (checklist or []) if isinstance(c, dict) and str(c.get("object", "")).strip()]
+    usable = [(k, st) for k, st in enumerate(steps) if st["type"] in (LOCAL, ASK_HELP, RECEIVE)]
+    pairs = []
+    for ci, c in enumerate(items):
+        obj = _tokens(str(c["object"]))
+        how = str(c.get("how", "")).upper().strip()
+        for k, st in usable:
+            sc = len(obj & _handled(st)) / len(obj) if obj else 0.0
+            if sc >= COVER:
+                pairs.append((sc + (0.01 if st["type"] == how else 0), ci, k))
+    used_c, used_s, match = set(), set(), {}
+    for sc, ci, k in sorted(pairs, reverse=True):
+        if ci in used_c or k in used_s:
+            continue
+        used_c.add(ci)
+        used_s.add(k)
+        match[ci] = k
+    errors, uncovered = [], []
+    for ci, c in enumerate(items):
+        obj, how = str(c["object"]), str(c.get("how", "")).upper().strip()
+        heavy = str(c.get("weight", "")).lower().strip() == "heavy"
+        if ci not in match:
+            uncovered.append(f"{obj}: {c.get('change', '')}".strip(": "))
+            errors.append(f"checklist entry '{obj}' ({c.get('change', '')}) has no step that names it. "
+                          f"Add a {how or 'LOCAL / ASK_HELP / RECEIVE'} step for it")
+            continue
+        st = steps[match[ci]]
+        if st["type"] == LOCAL and (how == ASK_HELP or heavy and _LIGHT_BODY.search(embodiment or "")):
+            errors.append(f"'{obj}' is {'heavy' if heavy else 'marked ASK_HELP'} but step '{st['action']}' does it "
+                          f"yourself. Your body cannot: write ASK_HELP to a robot whose body can move it")
+    return errors, uncovered
 
 
 def _check_mover(giver: str, receiver: str, cfg: TaskConfig, v: list[str]) -> None:
@@ -91,6 +151,15 @@ def validate(raw_steps: list[dict], agent: str, offers: dict[str, Offer], cfg: T
             v.append(f"LOCAL '{step['action']}' is not a physical action. Write what your body does to an "
                      f"object (move X from A to B, open, switch on, fill). If your body cannot do the real "
                      f"work (e.g. heavy furniture), do NOT drop it: write ASK_HELP to a robot that can")
+        m = _AFTER.search(step["action"]) if t in (LOCAL, ASK_HELP) else None
+        if m:
+            obj = _tokens(m.group(1))
+            earlier = [x for x in (raw_steps or [])[:i] if str(x.get("type", "")).upper().strip() in (LOCAL, ASK_HELP)
+                       and _cover(obj, str(x.get("action", ""))) >= COVER]
+            if obj and not earlier:
+                v.append(f"'{step['action']}' assumes '{m.group(1)}' was moved first, but no earlier step of "
+                         f"yours moves it. Add that step before it (LOCAL if your body can, otherwise ASK_HELP "
+                         f"with 'enables' = this step)")
         if t in (LOCAL, ASK_HELP) and (_OBSERVE.search(step["action"]) or _MOVE_ONLY.search(step["action"])):
             v.append(f"{t} '{step['action']}' only looks/checks/searches. Robots cannot explore and "
                      f"movement is part of HELP/PASS/RECEIVE: write only steps that change the room "
@@ -121,8 +190,9 @@ def validate(raw_steps: list[dict], agent: str, offers: dict[str, Offer], cfg: T
                         {norm(x) for x in offers[step["target"]].has_items}:
                     v.append(f"RECEIVE item '{step['item']}' is not in {step['target']}'s has_items "
                              f"{offers[step['target']].has_items}")
-                if not step["action"]:
-                    step["action"] = f"receive {step['item']}"
+                state = str(s.get("state") or "").strip()
+                if not step["action"] or state:
+                    step["action"] = f"receive {step['item']}" + (f" ({state})" if state else "")
         step["violations"] = v
         step["_raw_index"] = i
         step["enables"] = s.get("enables")
@@ -184,7 +254,7 @@ def coverage_advice(steps: list[dict], goals: list) -> list[str]:
 
 
 async def make_local_plan(cfg: TaskConfig, agent: str, offers: dict[str, Offer], llm: BaseLLM,
-                          log: EventLog, max_fix: int = 1) -> tuple[list[Node], dict]:
+                          log: EventLog, max_fix: int = 2) -> tuple[list[Node], dict]:
     me = cfg.agent(agent)
     own = offers[agent]
     system = plan_system(agent, me.profile.room)
@@ -196,12 +266,16 @@ async def make_local_plan(cfg: TaskConfig, agent: str, offers: dict[str, Offer],
                             **({"payload_kg": a.profile.payload_kg} if a.profile.payload_kg else {}),
                             "embodiment": a.profile.embodiment} for a in cfg.agents}),
     )
+    def check(d: dict):
+        steps, errors = validate(d.get("steps", []), agent, offers, cfg, d.get("goals") or [])
+        gaps = coverage_advice(steps, d.get("goals") or [])
+        cl_err, cl_unc = checklist_advice(steps, d.get("checklist") or [], me.profile.embodiment)
+        if gaps or cl_unc:
+            log.log("plan", agent, "uncovered", essential=len(gaps), checklist=len(cl_unc))
+        return steps, errors + gaps + cl_err, gaps, cl_unc
+
     d = await llm.complete(system, user, key=f"plan:{agent}")
-    steps, errors = validate(d.get("steps", []), agent, offers, cfg, d.get("goals") or [])
-    gaps = coverage_advice(steps, d.get("goals") or [])
-    if gaps:
-        errors = errors + gaps
-        log.log("plan", agent, "essential_goal_uncovered", n=len(gaps))
+    steps, errors, gaps, cl_unc = check(d)
     n_fix = 0
     while errors and n_fix < max_fix:
         n_fix += 1
@@ -209,7 +283,7 @@ async def make_local_plan(cfg: TaskConfig, agent: str, offers: dict[str, Offer],
         fix_user = user + "\n\nYOUR PREVIOUS PLAN:\n" + _j(d) + "\n\n" + PLAN_FIX.format(
             errors="\n".join(f"- {e}" for e in errors))
         d = await llm.complete(system, fix_user, key=f"plan:{agent}:fix")
-        steps, errors = validate(d.get("steps", []), agent, offers, cfg, d.get("goals") or [])
+        steps, errors, gaps, cl_unc = check(d)
 
     n = agent_num(agent)
     nodes = [Node(id=f"r{n}_s{k}", agent=agent, type=s["type"], action=s["action"], item=s["item"],
@@ -234,4 +308,5 @@ async def make_local_plan(cfg: TaskConfig, agent: str, offers: dict[str, Offer],
             requests=sum(x.type in REQUEST_TYPES and x.status == "active" for x in nodes),
             violations=sum(bool(x.violations) for x in nodes))
     return nodes, {"reasoning": d.get("reasoning", ""), "goals": d.get("goals") or [],
-                   "fix_rounds": n_fix, "remaining_errors": errors}
+                   "checklist": d.get("checklist") or [], "fix_rounds": n_fix, "remaining_errors": errors,
+                   "uncovered_essential": gaps, "uncovered_checklist": cl_unc}
