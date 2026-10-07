@@ -6,13 +6,15 @@ every request with its own (private) knowledge:
     any robot     -> already_doing (+ covered_by: an existing own step) for ASK_HELP
 
 already_doing adds NO step: the existing step is linked to the request
-(CONFIRMED if the robot is the target, PROPOSED otherwise). This stops a robot from adding a second
+(a candidate, PROPOSED; targeted if the robot is the target). This stops a robot from adding a second
 copy of work it already does.
 
 Accept / volunteer inserts ONE provider step (HELP or PASS) into the robot's OWN plan. The step is
 born with `answers=<request id>`, so pairing is by id, never by text matching.
-    accept    -> CONFIRMED edge   (requester asked + provider agreed)
-    volunteer -> PROPOSED edge    (self-nominated backup; Stage 4 may keep or release it)
+Every answer is only a CANDIDATE (PROPOSED edge). Nothing is confirmed here:
+    accept    -> PROPOSED, targeted=True   (the robot the requester named agreed)
+    volunteer -> PROPOSED, targeted=False  (self-nominated)
+Stage 4 confirms: one candidate -> by rule, several -> the Graph LLM chooses.
 
 Code checks each answer like Stage 2: HELP must cite a valid can_do index and respect mobility,
 PASS must hand over an item the robot actually has and has not already promised.
@@ -115,11 +117,10 @@ async def edge_proposal(cfg: TaskConfig, plans: dict[str, list[Node]], offers: d
                     record.append(rec)
                     log.log("propose", agent, "answer_rejected_by_check", request=rid)
                     continue
-                status = CONFIRMED if is_target else PROPOSED
-                edges.append(Edge(cov, rid, HELP_EDGE, status, "stage3"))
-                rec.update(result=status, provider=cov, covered=True)
+                edges.append(Edge(cov, rid, HELP_EDGE, PROPOSED, "stage3", targeted=is_target))
+                rec.update(result="CANDIDATE", provider=cov, covered=True, targeted=is_target)
                 record.append(rec)
-                log.log("propose", agent, "already_doing", request=rid, provider=cov, edge=status)
+                log.log("propose", agent, "already_doing", request=rid, provider=cov, edge="CANDIDATE")
                 continue
             if is_target and dec == "volunteer":
                 dec = "accept"
@@ -149,10 +150,9 @@ async def edge_proposal(cfg: TaskConfig, plans: dict[str, list[Node]], offers: d
                 mine = next((p for p in passes if p.agent == agent and p.target == req.agent
                              and norm(p.item) == norm(item) and not linked(p.id)), None)
                 if mine is not None:                  # I already offered exactly this: link, no copy
-                    status = CONFIRMED if dec == "accept" else PROPOSED
-                    edges.append(Edge(mine.id, rid, TRANSFER, status, "stage3"))
+                    edges.append(Edge(mine.id, rid, TRANSFER, PROPOSED, "stage3", targeted=dec == "accept"))
                     mine.answers = rid
-                    rec.update(result=status, provider=mine.id, linked_offer=True)
+                    rec.update(result="CANDIDATE", provider=mine.id, linked_offer=True)
                     record.append(rec)
                     log.log("propose", agent, "linked_own_offer", request=rid, provider=mine.id)
                     continue
@@ -176,11 +176,11 @@ async def edge_proposal(cfg: TaskConfig, plans: dict[str, list[Node]], offers: d
                         action=action, item=item, target=req.agent, uses=uses, location=location,
                         origin="accept" if dec == "accept" else "volunteer", answers=rid)
             _insert(plans[agent], node, j.get("insert_after"))
-            status = CONFIRMED if dec == "accept" else PROPOSED
-            edges.append(Edge(node.id, rid, TRANSFER if ptype == PASS else HELP_EDGE, status, "stage3"))
-            rec.update(result=status, provider=node.id)
+            edges.append(Edge(node.id, rid, TRANSFER if ptype == PASS else HELP_EDGE, PROPOSED, "stage3",
+                              targeted=dec == "accept"))
+            rec.update(result="CANDIDATE", provider=node.id, targeted=dec == "accept")
             record.append(rec)
-            log.log("propose", agent, f"{dec}", request=rid, provider=node.id, edge=status)
+            log.log("propose", agent, f"{dec}", request=rid, provider=node.id, edge="CANDIDATE")
 
     # ---- offers: the receiver decides. Receiving adds a RECEIVE (born linked to the PASS by id)
     # and the receiver's own LOCAL step that uses the object.
@@ -226,8 +226,8 @@ async def edge_proposal(cfg: TaskConfig, plans: dict[str, list[Node]], offers: d
             _insert(plans[agent], rcv, oj.get("insert_after"))
             plans[agent].insert(plans[agent].index(rcv) + 1, use)
             p.answers = rcv.id
-            edges.append(Edge(oid, rcv.id, TRANSFER, CONFIRMED, "stage3"))
-            rec.update(result=CONFIRMED, provider=oid, receive=rcv.id, use=use.id)
+            edges.append(Edge(oid, rcv.id, TRANSFER, PROPOSED, "stage3", targeted=True))
+            rec.update(result="CANDIDATE", provider=oid, receive=rcv.id, use=use.id)
             record.append(rec)
             log.log("propose", agent, "offer_received", offer=oid, receive=rcv.id, use=use.id)
     return edges, record
