@@ -4,7 +4,9 @@
 4b rule layer + issues    (code)
 4c semantic choice        (LLM, only on issues, only among code-given candidates)
 4d validate + apply ops   (code), re-check, at most `max_rounds`
-4e finalize + schedule    (code): block unresolvable parts, compute t_start / t_end
+4e finalize + schedule    (code): block unresolvable parts, compute the logical order t_start / t_end
+4f 5-minute phases        (LLM proposes a phase per step, code enforces the dependencies;
+                           rule fallback without an LLM)
 """
 from __future__ import annotations
 
@@ -13,7 +15,7 @@ import json
 from .graph import PlanGraph, normalize_op
 from .llm import BaseLLM
 from .log import EventLog
-from .prompts import GRAPH_SYSTEM, GRAPH_USER, _j
+from .prompts import GRAPH_SYSTEM, GRAPH_USER, PHASE_SYSTEM, PHASE_USER, _j
 from .schemas import Edge, Node, Offer, TaskConfig
 
 
@@ -42,4 +44,19 @@ async def graph_reasoning(cfg: TaskConfig, plans: dict[str, list[Node]], collab:
     g.finalize()
     g.check_invariants()
     log.log("graph", "-", "scheduled", makespan=g.makespan(), unresolved=len(g.unresolved))
+
+    proposed = None
+    if llm is not None:
+        robots = {a.id: {"room": a.profile.room, "mobile": a.profile.mobile, "body": a.profile.embodiment}
+                  for a in cfg.agents}
+        try:
+            d = await llm.complete(PHASE_SYSTEM.format(n_phases=g.n_phases()),
+                                   PHASE_USER.format(task=cfg.task, robots=_j(robots), steps=_j(g.phase_view())),
+                                   key="graph:phase")
+            proposed = d.get("phases") if isinstance(d.get("phases"), dict) else None
+        except Exception as e:  # noqa: BLE001  - phases are optional: fall back to the rule
+            log.log("graph", "llm", "phase_failed", error=str(e)[:120])
+    g.assign_phases(proposed)
+    log.log("graph", "-", "phased", source=g.phase_source, makespan_min=g.makespan_min(),
+            deadline=cfg.deadline_min, fixed=g.n_phase_fixed, missing=g.n_phase_missing)
     return g
