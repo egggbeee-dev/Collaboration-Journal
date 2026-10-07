@@ -11,7 +11,8 @@ Design rules
   There is no separate "carry" request. An object is moved by whichever end of the handoff is
   mobile (mobile giver brings it; otherwise a mobile receiver collects it). Two fixed robots
   cannot exchange objects.
-- Time is logical: every step takes one unit. No minutes, no travel time.
+- Time: code first computes a logical order (every step = one unit, no travel time); then
+  Stage 4 places every step in a 5-minute phase (PHASE_MIN), checked against the dependencies.
 """
 from __future__ import annotations
 
@@ -28,6 +29,8 @@ PROVIDER_FOR = {ASK_HELP: HELP, RECEIVE: PASS}
 
 SEQ, TRANSFER, HELP_EDGE = "SEQ", "TRANSFER", "HELP"
 CONFIRMED, PROPOSED = "CONFIRMED", "PROPOSED"
+
+PHASE_MIN = 5              # the Joint Plan is scheduled in 5-minute phases (assigned in Stage 4)
 
 
 def agent_num(agent: str) -> int:
@@ -148,6 +151,7 @@ class Node:
     prepared_by: str | None = None     # offered PASS -> own earlier LOCAL step that prepared the object
     status: str = "active"             # active | dropped | blocked
     violations: list[str] = field(default_factory=list)
+    phase: int | None = None           # 5-minute phase (1 = 0-5 min), assigned in Stage 4
     t_start: int | None = None
     t_end: int | None = None
 
