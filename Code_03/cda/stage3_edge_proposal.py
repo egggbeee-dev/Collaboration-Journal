@@ -26,13 +26,11 @@ from .llm import BaseLLM
 from .log import EventLog
 from .prompts import PROPOSE_USER, _j, indexed, propose_system
 from .schemas import (CONFIRMED, HELP, HELP_EDGE, PASS, PROPOSED, PROVIDER_FOR,
-                      REQUEST_TYPES, TRANSFER, Edge, Node, Offer, TaskConfig, agent_num, norm,
-                      snap_duration)
+                      REQUEST_TYPES, TRANSFER, Edge, Node, Offer, TaskConfig, agent_num, norm)
 
 
 def _plan_view(nodes: list[Node]) -> list[dict]:
-    return [{"id": n.id, "type": n.type, "text": n.text(), "target": n.target, "duration": n.duration}
-            for n in nodes]
+    return [{"id": n.id, "type": n.type, "text": n.text(), "target": n.target} for n in nodes]
 
 
 async def _judge(cfg: TaskConfig, agent: str, plans: dict[str, list[Node]], offers: dict[str, Offer],
@@ -46,23 +44,13 @@ async def _judge(cfg: TaskConfig, agent: str, plans: dict[str, list[Node]], offe
     user = PROPOSE_USER.format(task=cfg.task, own_offer=_j(offers[agent].to_dict()),
                                can_do_indexed=indexed(offers[agent].can_do),
                                own_plan=_j(_plan_view(plans[agent])),
-                               requests=_j([r.brief() | {"location": r.location, "duration": r.duration}
-                                            | ({"kind": "carry an object"} if r.basis == "carry" else {})
-                                            for r in visible]) if visible
+                               requests=_j([r.brief() | {"location": r.location} for r in visible]) if visible
                                else "(none)",
                                offers=_j([p.brief() | {"for": p.serves} for p in to_me]) if to_me else "(none)")
     d = await llm.complete(propose_system(agent), user, key=f"propose:{agent}")
     js, os_ = d.get("judgments", []) or [], d.get("offers", []) or []
     log.log("propose", agent, "judged", n=len(js), offers=len(os_))
     return js, os_
-
-
-def _carry_ends(req: Node, nodes: dict) -> set:
-    """giver and receiver of the object a carry request moves"""
-    h = nodes.get(req.carry_for)
-    if h is None:
-        return set()
-    return {h.agent, h.target}
 
 
 def _insert(order: list[Node], node: Node, after: str | None) -> None:
@@ -82,7 +70,6 @@ async def edge_proposal(cfg: TaskConfig, plans: dict[str, list[Node]], offers: d
     requests = [n for a in cfg.ids for n in plans[a] if n.type in REQUEST_TYPES and n.status == "active"]
     passes = [n for a in cfg.ids for n in plans[a] if n.type == PASS and n.origin == "offer" and n.status == "active"]
     by_id = {r.id: r for r in requests}
-    by_id_all = {n.id: n for a in cfg.ids for n in plans[a]}
     by_pass = {p.id: p for p in passes}
     raw = await asyncio.gather(*[_judge(cfg, a, plans, offers, requests, passes, llm, log) for a in cfg.ids])
 
@@ -151,17 +138,10 @@ async def edge_proposal(cfg: TaskConfig, plans: dict[str, list[Node]], offers: d
             uses, item, action = None, None, str(j.get("action", "") or "")
             if ptype == HELP:
                 uses = j.get("uses")
-                valid_uses = isinstance(uses, int) and 0 <= uses < len(offers[agent].can_do)
-                if req.basis == "carry" and not valid_uses:  # any mobile robot can carry what it can lift
-                    uses = None
-                elif not valid_uses:
+                if not (isinstance(uses, int) and 0 <= uses < len(offers[agent].can_do)):
                     problem = f"uses={uses} is not a valid can_do index"
-                if problem:
-                    pass
                 elif not me.profile.mobile and norm(req.location) != norm(me.profile.room):
                     problem = f"cannot leave {me.profile.room} to help in {req.location}"
-                elif req.basis == "carry" and agent in _carry_ends(req, by_id_all):
-                    problem = "the giver and the receiver stay in their rooms; another robot must carry it"
                 action = action or req.action
                 location = req.location
             else:
@@ -178,9 +158,11 @@ async def edge_proposal(cfg: TaskConfig, plans: dict[str, list[Node]], offers: d
                     continue
                 if stock[agent][norm(item)] <= 0:
                     problem = f"item '{item}' not available (not in has_items or already promised)"
+                elif cfg.mover(agent, req.agent) is None:
+                    problem = f"{agent} and {req.agent} are both fixed: nobody can move the object"
 
                 action = action or f"pass {item} to {req.agent}"
-                location = me.profile.room          # handed over at the room door
+                location = me.profile.room          # the mobile end of the handoff moves it
             if problem:
                 rec["result"] = f"rejected_by_check: {problem}"
                 record.append(rec)
@@ -192,7 +174,6 @@ async def edge_proposal(cfg: TaskConfig, plans: dict[str, list[Node]], offers: d
             counters[agent] += 1
             node = Node(id=f"r{agent_num(agent)}_s{counters[agent]}", agent=agent, type=ptype,
                         action=action, item=item, target=req.agent, uses=uses, location=location,
-                        duration=snap_duration(j.get("duration", 2)),
                         origin="accept" if dec == "accept" else "volunteer", answers=rid)
             _insert(plans[agent], node, j.get("insert_after"))
             status = CONFIRMED if dec == "accept" else PROPOSED
@@ -228,15 +209,19 @@ async def edge_proposal(cfg: TaskConfig, plans: dict[str, list[Node]], offers: d
                 record.append(rec)
                 log.log("propose", agent, "answer_rejected_by_check", offer=oid)
                 continue
+            if cfg.mover(p.agent, agent) is None:
+                rec["result"] = f"rejected_by_check: {p.agent} and {agent} are both fixed"
+                record.append(rec)
+                log.log("propose", agent, "answer_rejected_by_check", offer=oid)
+                continue
             n_ = agent_num(agent)
             counters[agent] += 1
             use = Node(id=f"r{n_}_s{counters[agent] + 1}", agent=agent, type="LOCAL",
                        action=str(oj.get("action") or f"use the {p.item}"), uses=uses,
-                       location=cfg.agent(agent).profile.room, duration=snap_duration(oj.get("duration", 1)),
-                       origin="accept", serves=f"offered {p.item}")
+                       location=cfg.agent(agent).profile.room, origin="accept", serves=f"offered {p.item}")
             rcv = Node(id=f"r{n_}_s{counters[agent]}", agent=agent, type="RECEIVE", item=p.item,
                        action=f"receive {p.item}", target=p.agent, location=cfg.agent(agent).profile.room,
-                       duration=1, origin="accept", enables=use.id, serves=f"offered {p.item}")
+                       origin="accept", enables=use.id, serves=f"offered {p.item}")
             counters[agent] += 1
             _insert(plans[agent], rcv, oj.get("insert_after"))
             plans[agent].insert(plans[agent].index(rcv) + 1, use)
