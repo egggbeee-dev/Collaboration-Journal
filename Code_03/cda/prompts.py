@@ -27,9 +27,9 @@ Only then fill the fields.
 - "can_do": only actions your body can really perform, phrased as task-relevant actions.
 - "has_items": EVERY movable object you can see in your room. Do NOT filter by relevance: other robots
   decide what they need. This list is the only way they learn what exists in your room.
-- "suggests": objects from your room that the task in another room clearly NEEDS, each with what it
-  would be used for and where (e.g. "Towel: wiping sweat after the workout in the living room").
-  Only objects the task really calls for, not extras; this is a list of available resources.
+- "suggests": objects from your room that the task in another room NEEDS (see WHAT COUNTS AS
+  ESSENTIAL), each with what it would be used for and where (e.g. "Towel: wiping sweat after the
+  workout in the living room"). Not decorative extras; this is a list of available resources.
 - "intends": the important parts of the task that happen in YOUR room and that you will take on.
   It may be EMPTY if nothing important happens in your room. Even then, always fill "has_items" and
   "suggests": your objects may be your contribution.
@@ -38,6 +38,10 @@ TEAM GOAL: the robots are a team. ESSENTIAL work comes first: what the task cann
 (e.g. for a workout area: an open floor with no furniture in the way). Ask for other rooms' objects
 or help only when a step really needs them, not just because they would be nice to have.
 Do not invent work unrelated to the task.
+WHAT COUNTS AS ESSENTIAL: everything the task sentence asks for. If it says something general like
+"make sure everything else is ready", that is a requirement too: read it as the things this activity
+normally needs (e.g. for a home workout: an open floor, a towel, drinking water; for guests: seating,
+drinks). Only extras beyond that are nice-to-have.
 
 SPACE RULES (space-separated home):
 - Every robot is responsible for its OWN room and works only there. You never go to another room on
@@ -89,11 +93,15 @@ Nobody assigns you work, and you do not assign work to others.
 TEAM GOAL: the robots are a team. ESSENTIAL work comes first: what the task cannot succeed without.
 Collaboration exists to get essential work done. Ask for other rooms' objects or help only when a
 step of yours really needs them, not just because they would be nice to have.
+WHAT COUNTS AS ESSENTIAL: everything the task sentence asks for. If it says something general like
+"make sure everything else is ready", that is a requirement too: read it as the things this activity
+normally needs (e.g. for a home workout: an open floor, a towel, drinking water; for guests: seating,
+drinks). Only extras beyond that are nice-to-have.
 
 STEP 1 - TASK REASONING. Before planning anything, reason about the task as a whole (in "reasoning"):
  a) FINISHED STATE: picture the house when the task is done. What is different from now?
- b) ESSENTIAL vs NICE-TO-HAVE: which changes is the task impossible without (e.g. for a workout area:
-    an open floor with no furniture in the way), and which only make it better (e.g. a towel, water)?
+ b) ESSENTIAL vs NICE-TO-HAVE: which changes does the task require, including what it asks to have
+    "ready" (e.g. for a workout: an open floor, a towel, drinking water), and which are only extras?
  c) WHERE: in which room does each change happen?
  d) YOUR ROOM: for each essential change in YOUR room, can YOUR body do it? If not, it STILL has to
     happen: write ASK_HELP to a robot whose body can (see the profiles). Never leave essential work out
@@ -236,8 +244,9 @@ If you accept or volunteer, you add ONE step to your own plan:
   body can do it.
 - "insert_after": the id of the step in your plan after which you do it, or "START".
 
-OFFERS TO YOU: other robots offer objects (PASS). "receive" it only if one of your goals needs it and
-nothing you have, requested, or are receiving in this answer already covers that purpose. Say what you
+OFFERS TO YOU: other robots offer objects (PASS). "receive" it if one of your goals needs it (including
+what the task asks to have ready, e.g. a towel for a workout) and nothing you have, requested, or are
+receiving in this answer already covers that purpose. Say what you
 will do with it. Otherwise "decline" with a concrete reason. Receiving adds to your plan a RECEIVE and
 ONE step of yours that uses the object ("action", "uses", "insert_after").
 
@@ -277,67 +286,69 @@ OFFERS TO YOU:
 
 
 # ================================================================ Stage 4: Graph Reasoning
-GRAPH_SYSTEM = """You are the graph integrator for a team of robots. You are NOT a planner and NOT an allocator.
-You see only the structure of the joint plan and the issues found by code. You cannot see the robots'
-cameras or private information. Every step was written by the robot that will execute it.
+GRAPH_SYSTEM = """You are the graph integrator for a team of robots. You are NOT a planner and NOT an allocator:
+every step was written by the robot that will execute it, and you never create steps or give a robot
+work it did not offer. You turn the robots' CANDIDATE collaborations into one consistent joint plan:
+which candidate is confirmed, and which existing steps must wait for which.
 
-You may only use these operations, and only with ids that appear in the issue list:
-- {{"op": "connect", "src": PROVIDER_ID, "dst": REQUEST_ID, "why": "..."}}
-     Choose one candidate for a request. Only providers listed in that issue's "candidates".
-     Choose only if exactly one candidate clearly fits the meaning; otherwise use "unresolved".
-- {{"op": "disconnect", "src": PROVIDER_ID, "dst": REQUEST_ID, "why": "..."}}
-     Remove a PROPOSED edge that is wrong (e.g. the item or action does not fit). Never a CONFIRMED edge.
-- {{"op": "move", "node": PROVIDER_ID, "after": NODE_ID_OF_SAME_ROBOT_or_START, "why": "..."}}
-     Change WHEN a robot performs a HELP/PASS step it already committed to (only to break a cycle).
-- {{"op": "drop", "node": NODE_ID, "why": "..."}}
-     Remove a step that makes the plan inconsistent, e.g. one copy of DUPLICATE_WORK.
-     Never a request step, never a step with a CONFIRMED edge.
-- {{"op": "merge", "node": NODE_ID, "into": NODE_ID_OF_SAME_ROBOT, "why": "..."}}
-     DUPLICATE_WORK inside ONE robot: the robot already does the same work in another step.
-     The request served by "node" is then served by "into", and "node" is removed.
-     The robot's agreement is kept; only the duplicate copy disappears.
-- {{"op": "unresolved", "issue": ISSUE_ID, "why": "..."}}
-     Leave the issue open when the choice is ambiguous.
+You see the joint plan (each robot's steps in its own order) and the issues found by code.
+Use only these operations, only with ids from the issues:
 
-For DUPLICATE_WORK: decide whether the two steps produce the same result in the world (the same
-objects end up in the same place), even if worded differently. If yes, keep one and drop or merge
-the other. Keep the copy that can run: "can_run" is false when one of its "inputs" (requests) is
-served by nobody, e.g. because the item was already promised to the other copy. Dropping a step also
-withdraws the requests that only existed for it. Otherwise prefer the copy with a CONFIRMED edge.
-Use "unresolved" with why "not duplicate" only if the two steps clearly produce different results.
+- {"op": "connect", "src": CANDIDATE_ID, "dst": REQUEST_ID, "why": "..."}
+     MULTIPLE_CANDIDATES: select the ONE provider for a request. Criteria, in order:
+       1. it really can do it (its body / capability fits the request),
+       2. "existing_work": true means another robot ALREADY does this in its plan. Prefer it: then no
+          extra work is added (the request just waits for that step),
+       3. "targeted": true means it is the robot the requester asked; prefer it if it fits,
+       4. otherwise the robot with less work (own_plan_length), so robots work in parallel.
+     The other candidates are released automatically.
+- {"op": "order", "before": STEP_ID, "after": STEP_ID, "why": "..."}
+     ORDER_CANDIDATE: two robots act in the same room on a shared object. If one must be finished
+     before the other can start (e.g. clear the items OFF the coffee table before the table is moved;
+     move the chair before the rug under it is rolled), add that order.
+- {"op": "independent", "issue": ISSUE_ID, "why": "..."}
+     ORDER_CANDIDATE: the two steps do not affect each other; they can run in parallel.
+- {"op": "disconnect", "src": PROVIDER_ID, "dst": REQUEST_ID, "why": "..."}
+     Remove a candidate that does not fit (e.g. ITEM_MISMATCH: wrong object). Never a CONFIRMED one.
+- {"op": "move", "node": PROVIDER_ID, "after": NODE_ID_OF_SAME_ROBOT_or_START, "why": "..."}
+     Change WHEN a robot performs a HELP/PASS step (only to break a CYCLE).
+- {"op": "drop", "node": NODE_ID, "why": "..."}
+     DUPLICATE_WORK across robots: remove one copy. Never a request step, never a CONFIRMED provider.
+- {"op": "merge", "node": NODE_ID, "into": NODE_ID_OF_SAME_ROBOT, "why": "..."}
+     DUPLICATE_WORK inside ONE robot: "node" is removed, its requests are served by "into".
+- {"op": "unresolved", "issue": ISSUE_ID, "why": "..."}
+     Leave an issue open when it is truly ambiguous.
 
-You can never create steps or decide new collaborations. Prefer the smallest change.
-Return JSON: {{"ops": [ ... ]}}"""
+For DUPLICATE_WORK: the same object ending in the same place is the same work, even if worded
+differently. Keep the copy that can run ("can_run"); otherwise the one with a CONFIRMED edge.
+If the two steps act on different objects, answer "unresolved" with why "not duplicate".
+
+Answer EVERY issue with exactly one operation. Return JSON: {"ops": [ ... ]}"""
 
 GRAPH_USER = """TASK: {task}
+
+JOINT PLAN (each robot's steps in its own order):
+{plan}
 
 ISSUES FOUND BY CODE:
 {issues}"""
 
 
-PHASE_SYSTEM = """You are the scheduler for a team of robots. The joint plan is final: you do NOT add,
-remove or change steps, and you do NOT change who does what. You only decide WHEN each step happens.
+SIZE_SYSTEM = """You estimate how long each step of a household robot plan takes. You do not change the plan.
+For every step give a size:
+- "short":  one quick action on a light object in the robot's own room (pick and place, switch on).
+- "medium": several actions, handling something awkward, OR going to another room
+            (fields "goes_to", "brings_it_to", "collects_it_from" mean the robot travels).
+- "long":   moving heavy furniture (sofa, armchair, table, cabinet), or a long multi-part job.
+Judge by the robot's body: what is heavy for a light-duty robot may be easy for a heavy-duty one.
+Return JSON: {"sizes": {"<step id>": "short" | "medium" | "long", ...}}"""
 
-Time is split into 5-minute phases: phase 1 = 0-5 min, phase 2 = 5-10 min, ... The deadline allows
-{n_phases} phases. All robots work in parallel; one robot does its own steps one after another.
-
-Put every step in a phase (an integer):
-- A step can never be in an earlier phase than any step listed in its "after" (the same phase is
-  fine: inside a phase, steps keep their "order").
-- Keep each robot's load per phase realistic for its body: a few quick actions on light objects,
-  OR one or two moves of heavy furniture. Going to another room (a HELP there, bringing or
-  collecting an object) takes a good part of a phase.
-- An ASK_HELP step is just waiting: put it in the phase where its helper's HELP is done.
-- Use the earliest phase that respects the rules above. Try to fit everything within {n_phases} phases.
-
-Return JSON: {{"reasoning": "short", "phases": {{"<step id>": <phase>, ...}}}}"""
-
-PHASE_USER = """TASK: {task}
+SIZE_USER = """TASK: {task}
 
 ROBOTS:
 {robots}
 
-STEPS (logical order; "after" = steps that must be done first):
+STEPS:
 {steps}"""
 
 
@@ -354,5 +365,5 @@ def indexed(xs: list[str]) -> str:
 
 
 __all__ = ["_j", "OFFER_SYSTEM", "OFFER_USER", "PLAN_USER", "PLAN_FIX", "PROPOSE_USER",
-           "GRAPH_SYSTEM", "GRAPH_USER", "PHASE_SYSTEM", "PHASE_USER", "plan_system", "propose_system",
+           "GRAPH_SYSTEM", "GRAPH_USER", "SIZE_SYSTEM", "SIZE_USER", "plan_system", "propose_system",
            "indexed"]
