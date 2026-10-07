@@ -82,8 +82,6 @@ class PlanGraph:
         self.request_outcome: dict[str, str] = {}        # request id -> declined | failed | moot
         self._initial_nodes = set(self.nodes)
         self._agreements = {(self.nodes[e.src].agent, e.dst) for e in collab if e.status == CONFIRMED}
-        self.carry_edges: list[Edge] = []               # PASS -> carrier HELP -> RECEIVE (timing only)
-        self.n_carry_moot = 0
         self.ops_log: list[dict] = []
         self.drops: list[dict] = []
         self.unresolved: list[dict] = []
@@ -115,8 +113,7 @@ class PlanGraph:
                 if not only_active or (self.active(e.src) and self.active(e.dst))]
 
     def edges(self) -> list[Edge]:
-        carry = [e for e in self.carry_edges if self.active(e.src) and self.active(e.dst)]
-        return self.seq_edges() + self.collab_edges() + carry
+        return self.seq_edges() + self.collab_edges()
 
     def nx(self) -> nx.DiGraph:
         g = nx.DiGraph()
@@ -402,12 +399,9 @@ class PlanGraph:
         self._drop_unrequested_handoff_prep()
         self._pass_after_prep()
         roots: list[tuple[str, str]] = []             # (node id, cause)
-        roots += self._resolve_carriers()
-        handled = {r for r, _ in roots}
         g = self.nx()
         for rid, r in self.nodes.items():
-            if r.type in REQUEST_TYPES and self.active(rid) and not self.providers_of(rid) and \
-                    r.basis != "carry" and rid not in handled:
+            if r.type in REQUEST_TYPES and self.active(rid) and not self.providers_of(rid):
                 reply = self.target_reply.get(rid, "")
                 declined = reply.startswith("reject") or reply.startswith("rejected_by_check")
                 cause = "declined" if declined else "failed"
@@ -482,65 +476,6 @@ class PlanGraph:
                         if p.type == PASS and p.prepared_by == n.id:
                             p.prepared_by = None
 
-    def _handoff_pair(self, c: Node) -> tuple[Node | None, Node | None]:
-        h = self.nodes.get(c.carry_for)
-        if h is None or not self.active(h.id):
-            return None, None
-        if h.type == PASS:
-            rcv = [self.nodes[e.dst] for e in self.collab.values() if e.src == h.id and self.active(e.dst)]
-            return h, (rcv[0] if rcv else None)
-        pas = [self.nodes[e.src] for e in self.collab.values() if e.dst == h.id and self.active(e.src)]
-        return (pas[0] if pas else None), h
-
-    def _resolve_carriers(self) -> list[tuple[str, str]]:
-        """Carry requests, grouped by the handoff (PASS, RECEIVE) they serve: giver and receiver may both
-        have asked. If the handoff did not happen, carrying is moot. If any request of the group has a
-        carrier, that one carries and the others are covered. If none has, the receiver cannot get the
-        object (its RECEIVE is blocked; declined if a named carrier said no)."""
-        roots = []
-        groups: dict = {}
-        for c in [n for n in self.nodes.values() if n.basis == "carry" and n.status == "active"]:
-            pas, rcv = self._handoff_pair(c)
-            if pas is None or rcv is None:
-                self._skip_carry(c, f"carrying not needed: the handoff for {c.carry_for} did not happen")
-                self.request_outcome[c.id] = "moot"
-                self.n_carry_moot += 1
-                continue
-            groups.setdefault((pas.id, rcv.id), []).append(c)
-        for (pid, rid), cs in groups.items():
-            pas, rcv = self.nodes[pid], self.nodes[rid]
-            served = [(c, self.nodes[e.src]) for c in cs for e in self.providers_of(c.id)]
-            if served:
-                c0, h = served[0]
-                for c in cs:
-                    if c is not c0:
-                        self._skip_carry(c, f"covered: {h.agent} already carries this object ({h.id})")
-                        self.request_outcome[c.id] = "covered"
-                self.carry_edges += [Edge(pas.id, h.id, "CARRY"), Edge(h.id, rcv.id, "CARRY")]
-                continue
-            declined = any(self.target_reply.get(c.id, "").startswith("reject") for c in cs)
-            cause = "declined" if declined else "failed"
-            for c in cs:
-                self.request_outcome[c.id] = cause
-                self.unresolved.append({"request": c.id, "agent": c.agent, "text": c.text(), "outcome": cause,
-                                        "why": f"no mobile robot carries the object ({c.target} "
-                                               f"{'declined' if declined else 'did not answer'})", "by": "rule"})
-                c.status = "blocked"
-                c.violations = c.violations + [f"blocked ({cause})"]
-            if pas.status == "active":
-                pas.status = "skipped"
-            self.request_outcome[rcv.id] = cause
-            roots.append((rcv.id, cause))
-        return roots
-
-    def _skip_carry(self, c: Node, reason: str) -> None:
-        c.status = "skipped"
-        for e in self.providers_of(c.id):
-            h = self.nodes[e.src]
-            h.status = "skipped"
-            self.drops.append({"node": h.id, "agent": h.agent, "type": h.type, "text": h.text(),
-                               "reason": reason, "by": "rule"})
-
     def _tighten_requests(self) -> None:
         """A request only has to be satisfied before the step it enables. If a robot wrote it earlier,
         it would sit idle waiting while it could do its independent work. Move each request to just
@@ -585,51 +520,26 @@ class PlanGraph:
                 self.n_released += 1
 
     def schedule(self) -> None:
-        """Space-separated home. Every robot works in its own room. Trips (travel_min each way):
-        HELP steps; a MOBILE giver's PASS (it brings the object to the receiver's room); a RECEIVE from a
-        FIXED giver (the receiver fetches it from the giver's room); and the way back home before the
-        next step there. RECEIVE ends `duration` after both the object and the receiver are there.
-        ASK_HELP ends when its helper ends."""
+        """Logical time: every step takes one unit; no minutes, no travel time.
+        A step starts when the robot's previous step is done (SEQ) and, for a RECEIVE / HELP-waiting
+        ASK_HELP, when the other robot's provider step is done. ASK_HELP is pure waiting: it ends
+        when its HELP ends and takes no unit of its own."""
         g = self.nx()
-        home = {a.id: a.profile.room for a in self.cfg.agents}
-        cur = dict(home)
-        mobile = {a.id: a.profile.mobile for a in self.cfg.agents}
         for nid in nx.topological_sort(g):
             n = self.nodes[nid]
             seq_preds = [p for p in g.predecessors(nid) if g.edges[p, nid]["kind"] == SEQ]
             collab_preds = [p for p in g.predecessors(nid) if g.edges[p, nid]["kind"] != SEQ]
-            if n.type == HELP:
-                place = n.location or cur[n.agent]
-            elif n.type == ASK_HELP:
-                place = None                              # waiting at home
-            elif n.type == PASS and mobile[n.agent]:      # mobile giver brings it to the receiver
-                rcv = [self.nodes[e.dst] for e in self.collab.values() if e.src == nid and self.active(e.dst)]
-                place = home[rcv[0].agent] if rcv else home[n.agent]
-            else:
-                place = home[n.agent]                     # LOCAL / PASS / RECEIVE at home
-            n.travel = 0
-            if n.type in (PASS, RECEIVE):
-                n.location = place or n.location
-            if place and norm(place) != norm(cur[n.agent]):
-                if mobile[n.agent]:
-                    n.travel = self.cfg.travel_min
-                    cur[n.agent] = place
-                else:
-                    self.warnings.append({"issue": "immobile robot would have to move", "node": nid,
-                                          "from": cur[n.agent], "to": place})
-            carry_preds = [p for p in g.predecessors(nid) if g.edges[p, nid]["kind"] == "CARRY"]
-            n.t_start = max([self.nodes[p].t_end for p in seq_preds] or [0])
-            if n.type == HELP and carry_preds:                 # carrier waits for the handover
-                n.t_start = max([n.t_start] + [self.nodes[p].t_end for p in carry_preds])
-            if n.type == ASK_HELP and n.basis == "carry":
-                n.t_end = n.t_start                            # the owner does not wait for the carrier
-            elif n.type == ASK_HELP:
-                n.t_end = max([n.t_start] + [self.nodes[p].t_end for p in collab_preds])
+            ready = max([self.nodes[p].t_end for p in seq_preds] or [0])
+            given = max([self.nodes[p].t_end for p in collab_preds] or [0])
+            if n.type == ASK_HELP:
+                n.t_start = ready
+                n.t_end = max(ready, given)
             elif n.type == RECEIVE:
-                arrive = [self.nodes[p].t_end for p in collab_preds]
-                n.t_end = max([n.t_start + n.travel] + arrive) + n.duration
+                n.t_start = max(ready, given)
+                n.t_end = n.t_start + 1
             else:
-                n.t_end = n.t_start + n.travel + n.duration
+                n.t_start = ready
+                n.t_end = n.t_start + 1
 
     # ------------------------------------------------------------ checks / export
     def check_invariants(self) -> None:
