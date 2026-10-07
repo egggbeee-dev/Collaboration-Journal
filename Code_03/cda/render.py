@@ -29,6 +29,9 @@ def _line(g: PlanGraph, nid: str) -> str:
         serves = [g.nodes[e.dst].agent for e in g.collab_edges() if e.src == nid]
         if serves:
             body += f" (also serves {', '.join(serves)}'s request)"
+    waits = [e.src for e in g.order_edges if e.dst == nid and g.active(e.src)]
+    if waits:
+        body += f" [after {', '.join(waits)}]"
     return f"- {n.agent} [{n.type}] {body}  ({nid})"
 
 
@@ -86,7 +89,7 @@ def metrics(g: PlanGraph, plan_meta: dict, llm_usage: dict) -> dict:
         "n_collab_edges_final": len(final_collab),
         "confirmed_ratio": round(n_conf / len(final_collab), 3) if final_collab else None,
         "selected_by_graph": n_graph,
-        "selected_by_rule_single_volunteer": len(g.selected_by_rule & {e.dst for e in final_collab}),
+        "selected_by_rule": len(g.selected_by_rule & {e.dst for e in final_collab}),
         "capability_violations_after_fix": sum(1 for n in nodes if n.type not in REQUEST_TYPES and
                                                any(not v.startswith("blocked (") for v in n.violations)),
         "n_requests_withdrawn": sum(1 for d in g.drops if d["by"] == "stage2-check"),
@@ -103,8 +106,11 @@ def metrics(g: PlanGraph, plan_meta: dict, llm_usage: dict) -> dict:
         "makespan_min": g.makespan_min(),
         "deadline": g.cfg.deadline_min,
         "deadline_ok": g.makespan_min() <= g.cfg.deadline_min,
-        "phase_source": getattr(g, "phase_source", None),
-        "n_phase_fixed_by_rule": getattr(g, "n_phase_fixed", 0),
+        "size_source": g.size_source,
+        "n_size_missing": g.n_size_missing,
+        "n_candidates_from_stage3": g.n_candidates,
+        "n_order_edges_added": g.n_order_added,
+        "n_order_pairs_independent": g.n_order_independent,
         "success_no_blocked": all(n.status != "blocked" for n in nodes),
         "n_requests_declined": sum(v == "declined" for v in g.request_outcome.values()),
         "n_requests_failed": sum(v == "failed" for v in g.request_outcome.values()),
