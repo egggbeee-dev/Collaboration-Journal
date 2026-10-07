@@ -13,13 +13,15 @@ def _line(g: PlanGraph, nid: str) -> str:
     if n.type == ASK_HELP:
         body = f"wait for {partner} to: {n.action}"
     elif n.type == RECEIVE:
-        body = f"receive {n.item} from {partner}"
+        body = (n.action if n.action and n.action != f"receive {n.item}" else f"receive {n.item}") + f" from {partner}"
         if partner and g.cfg.mover(partner, n.agent) == n.agent:
             body += f" (collects it from the {room[partner]})"
     elif n.type == HELP:
         body = f"{n.action} (help {n.target} in the {room.get(n.target, n.location)})"
     elif n.type == PASS:
-        body = f"pass {n.item} to {n.target}" + (" (offered)" if n.origin == "offer" else "")
+        prep = n.action and not n.action.lower().startswith("pass ")
+        body = (f"{n.action} -> {n.target}" if prep else f"pass {n.item} to {n.target}") \
+            + (" (offered)" if n.origin == "offer" else "")
         if g.cfg.mover(n.agent, n.target) == n.agent:
             body += f" (brings it to the {room.get(n.target, '?')})"
         else:
@@ -100,6 +102,9 @@ def metrics(g: PlanGraph, plan_meta: dict, llm_usage: dict) -> dict:
         "n_requests_moved_later": g.n_tightened,
         "n_warnings": len(g.warnings),
         "plan_fix_rounds": {a: m["fix_rounds"] for a, m in plan_meta.items()},
+        "n_checklist_items": sum(len(m.get("checklist") or []) for m in plan_meta.values()),
+        "n_uncovered_checklist": sum(len(m.get("uncovered_checklist") or []) for m in plan_meta.values()),
+        "n_uncovered_essential": sum(len(m.get("uncovered_essential") or []) for m in plan_meta.values()),
         "graph_ops_applied": sum(o["applied"] for o in g.ops_log),
         "graph_ops_rejected": sum(not o["applied"] for o in g.ops_log),
         "makespan_steps": g.makespan(),
