@@ -315,6 +315,32 @@ ISSUES FOUND BY CODE:
 {issues}"""
 
 
+PHASE_SYSTEM = """You are the scheduler for a team of robots. The joint plan is final: you do NOT add,
+remove or change steps, and you do NOT change who does what. You only decide WHEN each step happens.
+
+Time is split into 5-minute phases: phase 1 = 0-5 min, phase 2 = 5-10 min, ... The deadline allows
+{n_phases} phases. All robots work in parallel; one robot does its own steps one after another.
+
+Put every step in a phase (an integer):
+- A step can never be in an earlier phase than any step listed in its "after" (the same phase is
+  fine: inside a phase, steps keep their "order").
+- Keep each robot's load per phase realistic for its body: a few quick actions on light objects,
+  OR one or two moves of heavy furniture. Going to another room (a HELP there, bringing or
+  collecting an object) takes a good part of a phase.
+- An ASK_HELP step is just waiting: put it in the phase where its helper's HELP is done.
+- Use the earliest phase that respects the rules above. Try to fit everything within {n_phases} phases.
+
+Return JSON: {{"reasoning": "short", "phases": {{"<step id>": <phase>, ...}}}}"""
+
+PHASE_USER = """TASK: {task}
+
+ROBOTS:
+{robots}
+
+STEPS (logical order; "after" = steps that must be done first):
+{steps}"""
+
+
 def plan_system(agent: str, room: str) -> str:
     return PLAN_SYSTEM.format(agent=agent, room=room)
 
@@ -328,4 +354,5 @@ def indexed(xs: list[str]) -> str:
 
 
 __all__ = ["_j", "OFFER_SYSTEM", "OFFER_USER", "PLAN_USER", "PLAN_FIX", "PROPOSE_USER",
-           "GRAPH_SYSTEM", "GRAPH_USER", "plan_system", "propose_system", "indexed"]
+           "GRAPH_SYSTEM", "GRAPH_USER", "PHASE_SYSTEM", "PHASE_USER", "plan_system", "propose_system",
+           "indexed"]
