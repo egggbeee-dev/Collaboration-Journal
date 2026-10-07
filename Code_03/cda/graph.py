@@ -18,8 +18,8 @@ import re
 
 import networkx as nx
 
-from .schemas import (ASK_HELP, CONFIRMED, HELP, LOCAL, PASS, PROPOSED, PROVIDER_TYPES, RECEIVE,
-                      REQUEST_TYPES, SEQ, Edge, Node, Offer, TaskConfig, norm)
+from .schemas import (ASK_HELP, CONFIRMED, HELP, LOCAL, PASS, PHASE_MIN, PROPOSED, PROVIDER_TYPES,
+                      RECEIVE, REQUEST_TYPES, SEQ, Edge, Node, Offer, TaskConfig, norm)
 
 _STOP = set("a an the to of on in at into onto from for with and or by it its them their this that "
             "your my our be is are up down near next robot".split())
@@ -37,6 +37,26 @@ def _tokens(text: str) -> set[str]:
 def _jaccard(a: str, b: str) -> float:
     x, y = _tokens(a), _tokens(b)
     return len(x & y) / len(x | y) if x and y else 0.0
+
+
+# "move the left red chair from the workout area to the wall" -> "left red chair"
+_OBJ = re.compile(r"^\s*(?:use\s+\S+(?:\s+\S+)?\s+(?:capability\s+)?to\s+)?[a-z]+(?:\s+(?:up|out|away|back|on|off))?\s+"
+                  r"(?:the\s+|a\s+|an\s+)?(.+?)(?:\s+(?:from|to|onto|into|on|at|in|out of|off|away|"
+                  r"against|beside|next to|near|under|so|and|without|for|with)\b|$)", re.I)
+
+
+def object_of(action: str) -> set[str]:
+    """Tokens of the object a step acts on (the phrase after the verb, before the first place word)."""
+    m = _OBJ.search(action or "")
+    return _tokens(m.group(1)) if m else set()
+
+
+def same_object(a: str, b: str) -> bool | None:
+    """True/False if both objects can be read; None if one cannot (fall back to whole-text similarity)."""
+    x, y = object_of(a), object_of(b)
+    if not x or not y:
+        return None
+    return x <= y or y <= x or len(x & y) / len(x | y) >= 0.8   # "left chair" vs "right chair" differ
 
 
 _TRANSFORM = re.compile(r"\b(fill|refill|rinse|wash|clean|wipe|dry|heat|warm|cool|chill|cut|slice|peel|chop|"
@@ -283,10 +303,15 @@ class PlanGraph:
             sy = {e.dst for e in self.collab.values() if e.src == y.id}
             if sx & sy:            # competing answers to one request -> MULTIPLE_VOLUNTEERS handles it
                 continue
+            if x.agent == y.agent and sx and sy:
+                continue           # one robot answering two different requests: two different jobs
             if x.location and y.location and norm(x.location) != norm(y.location):
                 continue           # work in different rooms is never the same work
+            obj = same_object(x.action, y.action)
+            if obj is False:
+                continue           # different objects (e.g. the left chair vs the right chair)
             sim = _jaccard(x.action, y.action)
-            if sim >= DUP_THRESHOLD:
+            if sim >= DUP_THRESHOLD or obj is True and sim >= DUP_THRESHOLD - 0.2:
                 issues.append({"id": f"I{next(cid)}", "issue": "DUPLICATE_WORK",
                                "similarity": round(sim, 2),
                                "nodes": [self._work_view(x), self._work_view(y)],
@@ -540,6 +565,57 @@ class PlanGraph:
             else:
                 n.t_start = ready
                 n.t_end = n.t_start + 1
+
+    # ------------------------------------------------------------ 4f: 5-minute phases
+    def n_phases(self) -> int:
+        return max(1, -(-self.cfg.deadline_min // PHASE_MIN))
+
+    def phase_view(self) -> list[dict]:
+        """What the phase planner sees: every active step in logical order with what it waits for."""
+        g = self.nx()
+        out = []
+        for nid in sorted(g.nodes, key=lambda i: (self.nodes[i].t_start, self.nodes[i].agent, i)):
+            n = self.nodes[nid]
+            d = n.brief() | {"order": n.t_start, "after": sorted(g.predecessors(nid))}
+            if n.type == HELP:
+                d["in_room"] = n.location
+            out.append(d)
+        return out
+
+    def assign_phases(self, proposed: dict | None, steps_per_phase: int = 3) -> None:
+        """Place every active step in a 5-minute phase.
+        `proposed` = {node id: phase} from the Graph LLM (None -> rule fallback: `steps_per_phase`
+        logical steps per phase). Code then enforces, in topological order:
+          - a step is never in an earlier phase than any step it depends on (same phase is fine:
+            the order inside a phase follows the logical order),
+          - ASK_HELP is waiting, so it sits in the phase where its helper finishes."""
+        g = self.nx()
+        self.phase_source = "graph_llm" if proposed else "rule"
+        self.n_phase_fixed = 0
+        self.n_phase_missing = 0
+        for nid in nx.topological_sort(g):
+            n = self.nodes[nid]
+            need = max([self.nodes[p].phase for p in g.predecessors(nid)] or [1])
+            fallback = n.t_start // steps_per_phase + 1
+            want = None
+            if proposed:
+                v = proposed.get(nid)
+                try:
+                    want = int(v)
+                except (TypeError, ValueError):
+                    self.n_phase_missing += 1
+            if want is None:
+                want = max(fallback, need)
+            if n.type == ASK_HELP:
+                want = need
+            elif want < need:
+                self.n_phase_fixed += 1
+                want = need
+            n.phase = max(1, want)
+
+    def makespan_min(self) -> int:
+        ph = [n.phase for n in self.nodes.values() if n.status == "active" and n.phase]
+        return max(ph or [0]) * PHASE_MIN
 
     # ------------------------------------------------------------ checks / export
     def check_invariants(self) -> None:
