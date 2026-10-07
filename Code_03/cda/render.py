@@ -9,38 +9,34 @@ def _line(g: PlanGraph, nid: str) -> str:
     n = g.nodes[nid]
     prov = g.providers_of(nid)
     partner = g.nodes[prov[0].src].agent if prov else None
-    if n.type == ASK_HELP and n.basis == "carry":
-        body = f"asks {partner} to {n.action}"
-    elif n.type == ASK_HELP:
+    room = {a.id: a.profile.room for a in g.cfg.agents}
+    if n.type == ASK_HELP:
         body = f"wait for {partner} to: {n.action}"
     elif n.type == RECEIVE:
         body = f"receive {n.item} from {partner}"
+        if partner and g.cfg.mover(partner, n.agent) == n.agent:
+            body += f" (collects it from the {room[partner]})"
     elif n.type == HELP:
-        body = f"{n.action} (help {n.target})" + (f" [+{n.travel}m travel to {n.location}]" if n.travel else "")
+        body = f"{n.action} (help {n.target} in the {room.get(n.target, n.location)})"
     elif n.type == PASS:
         body = f"pass {n.item} to {n.target}" + (" (offered)" if n.origin == "offer" else "")
-        if n.travel:
-            body += f" [+{n.travel}m to bring it to the {n.location}]"
+        if g.cfg.mover(n.agent, n.target) == n.agent:
+            body += f" (brings it to the {room.get(n.target, '?')})"
+        else:
+            body += f" (hands it over; {n.target} collects it)"
     else:
         body = n.action
         serves = [g.nodes[e.dst].agent for e in g.collab_edges() if e.src == nid]
         if serves:
             body += f" (also serves {', '.join(serves)}'s request)"
-        if n.travel:
-            body += f" [+{n.travel}m back to {n.location}]"
-    if n.type == RECEIVE:
-        carrier = [g.nodes[e.src].agent for e in g.carry_edges if e.dst == nid and g.active(e.src)]
-        if carrier:
-            body += f" (carried by {carrier[0]})"
-    return f"- {n.agent} [{n.type}] {body}  ({nid})  → t={n.t_end}"
+    return f"- {n.agent} [{n.type}] {body}  ({nid})"
 
 
 def render(g: PlanGraph) -> str:
     act = sorted((nid for nid, n in g.nodes.items() if n.status == "active"),
                  key=lambda i: (g.nodes[i].t_start, g.nodes[i].agent, i))
     ms = g.makespan()
-    ok = "OK" if ms <= g.cfg.deadline_min else "MISSED"
-    lines = [f"### Joint Plan — {g.cfg.task_id}  (makespan {ms} min / deadline {g.cfg.deadline_min} min: {ok})", ""]
+    lines = [f"### Joint Plan — {g.cfg.task_id}  (makespan {ms} steps)", ""]
     last = None
     for i in act:
         if g.nodes[i].t_start != last:
@@ -101,9 +97,7 @@ def metrics(g: PlanGraph, plan_meta: dict, llm_usage: dict) -> dict:
         "plan_fix_rounds": {a: m["fix_rounds"] for a, m in plan_meta.items()},
         "graph_ops_applied": sum(o["applied"] for o in g.ops_log),
         "graph_ops_rejected": sum(not o["applied"] for o in g.ops_log),
-        "makespan": g.makespan(),
-        "deadline": g.cfg.deadline_min,
-        "deadline_ok": g.makespan() <= g.cfg.deadline_min,
+        "makespan_steps": g.makespan(),
         "success_no_blocked": all(n.status != "blocked" for n in nodes),
         "n_requests_declined": sum(v == "declined" for v in g.request_outcome.values()),
         "n_requests_failed": sum(v == "failed" for v in g.request_outcome.values()),
@@ -116,8 +110,7 @@ def metrics(g: PlanGraph, plan_meta: dict, llm_usage: dict) -> dict:
         "n_offers_taken": sum(1 for e in final_collab if g.nodes[e.src].origin == "offer"),
         "n_offers_untaken": g.n_offers_untaken,
         "n_preparations_released": g.n_prep_released,
-        "n_carry_requests": sum(1 for n in nodes if n.type == "ASK_HELP" and n.basis == "carry"),
-        "n_carries": len([e for e in g.carry_edges if e.dst and g.nodes[e.dst].type == "RECEIVE"
-                          and g.active(e.src) and g.active(e.dst)]),
+        "n_help_edges": sum(1 for e in final_collab if e.kind == "HELP"),
+        "n_transfer_edges": sum(1 for e in final_collab if e.kind == "TRANSFER"),
         **llm_usage,
     }
