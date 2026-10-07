@@ -5,6 +5,13 @@ Design rules
 - Every edge means the same thing: `src` must finish before `dst` can finish.
 - The graph stage may drop steps or move a provider step, but it can never create a step
   and never remove a CONFIRMED edge (checked in graph.py).
+- Two kinds of collaboration only:
+    ASK_HELP <-> HELP     capability: work the requester's body cannot do
+    RECEIVE  <-> PASS     object: an object from another room
+  There is no separate "carry" request. An object is moved by whichever end of the handoff is
+  mobile (mobile giver brings it; otherwise a mobile receiver collects it). Two fixed robots
+  cannot exchange objects.
+- Time is logical: every step takes one unit. No minutes, no travel time.
 """
 from __future__ import annotations
 
@@ -21,16 +28,6 @@ PROVIDER_FOR = {ASK_HELP: HELP, RECEIVE: PASS}
 
 SEQ, TRANSFER, HELP_EDGE = "SEQ", "TRANSFER", "HELP"
 CONFIRMED, PROPOSED = "CONFIRMED", "PROPOSED"
-
-DURATIONS = (1, 2, 3, 5, 10)               # minutes; LLM picks one of these
-
-
-def snap_duration(x) -> int:
-    try:
-        v = float(x)
-    except (TypeError, ValueError):
-        return 2
-    return min(DURATIONS, key=lambda d: abs(d - v))
 
 
 def agent_num(agent: str) -> int:
@@ -64,8 +61,6 @@ class TaskConfig:
     task: str
     deadline_min: int
     agents: list[AgentInput]
-    travel_min: int = 2        # added when a HELP step happens in another robot's room
-    handoff_min: int = 2       # an object handed over at the room doors (RECEIVE <- PASS)
 
     @classmethod
     def load(cls, path: str | Path) -> "TaskConfig":
@@ -76,13 +71,11 @@ class TaskConfig:
             imgs = [str((path.parent / p).resolve()) if not Path(p).is_absolute() else p
                     for p in a.get("images", [])]
             agents.append(AgentInput(a["id"], Profile(**a["profile"]), imgs, a.get("instruction", "")))
-        return cls(d["task_id"], d["task"], d["deadline_min"], agents, d.get("travel_min", 2),
-                   d.get("handoff_min", 2))
+        return cls(d["task_id"], d["task"], d["deadline_min"], agents)
 
     @classmethod
     def from_notebook(cls, task: str, agents: list[dict], deadline_min: int = 20,
-                      task_id: str = "task", travel_min: int = 2,
-                      handoff_min: int = 2) -> "TaskConfig":
+                      task_id: str = "task") -> "TaskConfig":
         """agents: [{"room", "mobile", "capability", "images", "hidden_info", "payload_kg"?}, ...]
         Robots are named R1..Rn in the given order. `hidden_info` (str or list of lines) becomes
         the robot's private text about what it cannot see / knows only itself."""
@@ -94,7 +87,7 @@ class TaskConfig:
                                                    payload_kg=(float(a["payload_kg"]) if a.get("payload_kg") else None),
                                                    embodiment=a["capability"]),
                                   list(a.get("images", [])), hid))
-        return cls(task_id, task, deadline_min, out, travel_min, handoff_min)
+        return cls(task_id, task, deadline_min, out)
 
     def agent(self, aid: str) -> AgentInput:
         return next(a for a in self.agents if a.id == aid)
@@ -102,6 +95,15 @@ class TaskConfig:
     @property
     def ids(self) -> list[str]:
         return [a.id for a in self.agents]
+
+    def mover(self, giver: str, receiver: str) -> str | None:
+        """Who physically moves an object from giver's room to receiver's room.
+        A mobile giver brings it; otherwise a mobile receiver collects it; two fixed robots: None."""
+        if giver in self.ids and self.agent(giver).profile.mobile:
+            return giver
+        if receiver in self.ids and self.agent(receiver).profile.mobile:
+            return receiver
+        return None
 
 
 # ---------------------------------------------------------------- stage 1
@@ -139,17 +141,13 @@ class Node:
     target: str | None = None          # request: who is asked; provider: requester agent
     uses: int | None = None            # index into the agent's own can_do
     location: str = ""
-    duration: int = 2
     origin: str = "local"              # local | accept | volunteer
     answers: str | None = None         # provider -> id of the request it answers
     enables: str | None = None         # request -> id of the own later step that needs it
     serves: str | None = None          # the task goal (from the robot's own goal list) this step serves
     prepared_by: str | None = None     # offered PASS -> own earlier LOCAL step that prepared the object
-    basis: str = "dependency"          # ASK_HELP: "dependency" (enables a later step) | "carry" (transport)
-    carry_for: str | None = None       # carry request -> id of the PASS or RECEIVE whose object it moves
     status: str = "active"             # active | dropped | blocked
     violations: list[str] = field(default_factory=list)
-    travel: int = 0                    # added by the scheduler
     t_start: int | None = None
     t_end: int | None = None
 
