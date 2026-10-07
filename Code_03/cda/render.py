@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from .graph import PlanGraph
-from .schemas import ASK_HELP, CONFIRMED, HELP, PASS, RECEIVE, REQUEST_TYPES
+from .schemas import ASK_HELP, CONFIRMED, HELP, PASS, PHASE_MIN, RECEIVE, REQUEST_TYPES
 
 
 def _line(g: PlanGraph, nid: str) -> str:
@@ -34,14 +34,16 @@ def _line(g: PlanGraph, nid: str) -> str:
 
 def render(g: PlanGraph) -> str:
     act = sorted((nid for nid, n in g.nodes.items() if n.status == "active"),
-                 key=lambda i: (g.nodes[i].t_start, g.nodes[i].agent, i))
-    ms = g.makespan()
-    lines = [f"### Joint Plan — {g.cfg.task_id}  (makespan {ms} steps)", ""]
+                 key=lambda i: (g.nodes[i].phase or 0, g.nodes[i].t_start, g.nodes[i].agent, i))
+    ms = g.makespan_min()
+    ok = "OK" if ms <= g.cfg.deadline_min else "MISSED"
+    lines = [f"### Joint Plan — {g.cfg.task_id}  (about {ms} min / deadline {g.cfg.deadline_min} min: {ok})", ""]
     last = None
     for i in act:
-        if g.nodes[i].t_start != last:
-            last = g.nodes[i].t_start
-            lines += ([""] if len(lines) > 2 else []) + [f"[t={last}]"]
+        ph = g.nodes[i].phase or 0
+        if ph != last:
+            last = ph
+            lines += ([""] if len(lines) > 2 else []) + [f"[{(ph - 1) * PHASE_MIN}-{ph * PHASE_MIN} min]"]
         lines.append(_line(g, i))
     blocked = [n for n in g.nodes.values() if n.status == "blocked"]
     skipped = [n for n in g.nodes.values() if n.status == "skipped"]
@@ -98,6 +100,11 @@ def metrics(g: PlanGraph, plan_meta: dict, llm_usage: dict) -> dict:
         "graph_ops_applied": sum(o["applied"] for o in g.ops_log),
         "graph_ops_rejected": sum(not o["applied"] for o in g.ops_log),
         "makespan_steps": g.makespan(),
+        "makespan_min": g.makespan_min(),
+        "deadline": g.cfg.deadline_min,
+        "deadline_ok": g.makespan_min() <= g.cfg.deadline_min,
+        "phase_source": getattr(g, "phase_source", None),
+        "n_phase_fixed_by_rule": getattr(g, "n_phase_fixed", 0),
         "success_no_blocked": all(n.status != "blocked" for n in nodes),
         "n_requests_declined": sum(v == "declined" for v in g.request_outcome.values()),
         "n_requests_failed": sum(v == "failed" for v in g.request_outcome.values()),
