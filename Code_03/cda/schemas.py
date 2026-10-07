@@ -3,16 +3,19 @@
 Design rules
 - Step IDs ("r2_s3") are created by code only, never by an LLM, and never renumbered.
 - Every edge means the same thing: `src` must finish before `dst` can finish.
-- The graph stage may drop steps or move a provider step, but it can never create a step
-  and never remove a CONFIRMED edge (checked in graph.py).
+- Stage 3 only produces CANDIDATE collaborations (status PROPOSED). Stage 4 confirms them:
+  a request with one candidate is confirmed by rule, one with several by the Graph LLM.
+- The graph stage may drop steps, move a provider step and add ORDER edges between existing steps,
+  but it can never create a step and never remove a CONFIRMED edge (checked in graph.py).
 - Two kinds of collaboration only:
     ASK_HELP <-> HELP     capability: work the requester's body cannot do
     RECEIVE  <-> PASS     object: an object from another room
   There is no separate "carry" request. An object is moved by whichever end of the handoff is
   mobile (mobile giver brings it; otherwise a mobile receiver collects it). Two fixed robots
   cannot exchange objects.
-- Time: code first computes a logical order (every step = one unit, no travel time); then
-  Stage 4 places every step in a 5-minute phase (PHASE_MIN), checked against the dependencies.
+- Time: code first computes a logical order (every step = one unit, no travel time). Stage 4 then
+  has each step judged short / medium / long and packs the steps into 5-minute phases (PHASE_MIN)
+  with a per-robot capacity, in dependency order (deterministic).
 """
 from __future__ import annotations
 
@@ -27,7 +30,7 @@ REQUEST_TYPES = {ASK_HELP, RECEIVE}        # created in Stage 2
 PROVIDER_TYPES = {HELP, PASS}              # created only in Stage 3, as answers to a request
 PROVIDER_FOR = {ASK_HELP: HELP, RECEIVE: PASS}
 
-SEQ, TRANSFER, HELP_EDGE = "SEQ", "TRANSFER", "HELP"
+SEQ, TRANSFER, HELP_EDGE, ORDER = "SEQ", "TRANSFER", "HELP", "ORDER"   # ORDER: added by Stage 4
 CONFIRMED, PROPOSED = "CONFIRMED", "PROPOSED"
 
 PHASE_MIN = 5              # the Joint Plan is scheduled in 5-minute phases (assigned in Stage 4)
@@ -151,6 +154,7 @@ class Node:
     prepared_by: str | None = None     # offered PASS -> own earlier LOCAL step that prepared the object
     status: str = "active"             # active | dropped | blocked
     violations: list[str] = field(default_factory=list)
+    size: str | None = None            # short | medium | long, judged in Stage 4 (for phase packing)
     phase: int | None = None           # 5-minute phase (1 = 0-5 min), assigned in Stage 4
     t_start: int | None = None
     t_end: int | None = None
@@ -175,9 +179,10 @@ class Node:
 class Edge:
     src: str
     dst: str
-    kind: str                          # SEQ | TRANSFER | HELP
-    status: str = CONFIRMED            # CONFIRMED | PROPOSED  (SEQ is always CONFIRMED)
-    source: str = "local"              # local | stage3 | graph
+    kind: str                          # SEQ | TRANSFER | HELP | ORDER
+    status: str = CONFIRMED            # CONFIRMED | PROPOSED  (SEQ / ORDER are always CONFIRMED)
+    source: str = "local"              # local | stage3 | rule | graph
+    targeted: bool = False             # candidate from the robot the requester named (accept)
 
     @property
     def key(self) -> tuple[str, str]:
