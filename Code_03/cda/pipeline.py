@@ -53,6 +53,10 @@ async def run_pipeline(cfg: TaskConfig, llm: BaseLLM, *, use_edge_proposal: bool
                               llm if use_graph_llm else None, log, max_graph_rounds)
 
     text = render(g)
+    uncovered = [(a, u) for a in ids for u in plan_meta[a].get("uncovered_checklist", [])]
+    if uncovered:     # the robots' own checklists name work that no step does: make it visible
+        text += "\n\n### Not covered (from the robots' own checklists)\n" + "\n".join(
+            f"- {a}: {u}" for a, u in uncovered)
     m = metrics(g, plan_meta, llm.usage())
     m["config"] = {"use_edge_proposal": use_edge_proposal, "use_graph_llm": use_graph_llm,
                    "max_graph_rounds": max_graph_rounds}
