@@ -109,12 +109,23 @@ STEP 1 - TASK REASONING. Before planning anything, reason about the task as a wh
 Then write "goals": each with "goal", "priority" (high = essential, medium/low = nice-to-have) and
 "in_my_room" (true if it happens in your room). Only goals of the TASK, not general housekeeping.
 
-STEP 2 - REQUIREMENTS FIRST, CAPABILITY SECOND. List every change your room needs for YOUR goals,
-ignoring your own body at first. Then sort each one:
- - your body can do it in your room            -> LOCAL
- - your body cannot do it (see your cannot_do)  -> ASK_HELP to a robot whose body can
- - it needs an object from another room          -> RECEIVE, then your LOCAL step that uses it
-Never drop a required change because your body cannot do it: that is exactly what ASK_HELP is for.
+STEP 2 - CHECKLIST (requirements first, capability second). Look at your images and write
+"checklist": EVERY object in your room that must change for YOUR goals, one entry per object
+(e.g. the left chair and the right chair are two entries), plus every object you need from
+another room. Ignore your own body while listing. For each entry give:
+ - "object": the object, named as in your images / has_items (for another room: as in their has_items)
+ - "change": what must happen to it (e.g. "moved from the workout floor to the wall")
+ - "weight": "light" (can be picked up and carried) or "heavy" (furniture that cannot be picked
+   up: tables, chairs, armchairs, sofas, cabinets; it must be pushed or lifted by a strong body)
+ - "how": who makes the change, judged by YOUR body:
+     LOCAL     your body can do it in your room
+     ASK_HELP  your body cannot (e.g. a heavy object and you are light-duty) -> a robot that can
+     RECEIVE   the object is in another room
+Then EVERY checklist entry must get its own step (LOCAL / ASK_HELP / RECEIVE + a LOCAL that uses it)
+that names the object. Code checks this. Never drop a required change because your body cannot do
+it: that is exactly what ASK_HELP is for. If a step can only happen after another object was moved
+(e.g. rolling the rug after the table is gone), that object must be in the checklist and have its own
+earlier step.
 
 STEP 3 - FROM OTHER ROOMS. Other robots' "suggests" are AVAILABLE RESOURCES, not a to-do list.
 Write a RECEIVE only if one of your goals needs that object and nothing in your own room covers it.
@@ -133,6 +144,9 @@ Do high-priority goals first. Use only these step types:
             YOUR OWN later LOCAL steps can happen. Requires "target", "action", "enables".
 - RECEIVE:  you need an OBJECT for one of YOUR OWN later LOCAL steps.
             Requires "target", "item" (copied exactly from the target's has_items), "enables".
+            Optional "state": how many / in what state you need it, if it matters (e.g. "one glass,
+            filled with drinking water"). The giver prepares that state; do not assume a state you
+            did not ask for.
 "enables" is the index (0-based, in your "steps" list) of YOUR OWN later LOCAL step that is
 physically impossible before the request is done (e.g. you cannot put the Mug on the table before
 you receive the Mug). Never request parts of the task your own steps do not depend on.
@@ -166,7 +180,8 @@ OBJECT HANDOFFS (two ways, both decided by the other side):
 PHYSICAL RULES (simulator): a robot holds at most ONE object at a time. Write moving an object as
 ONE step with its destination, e.g. "move the Mug from the counter to the CoffeeTable". Never group
 objects in one step with lists ("the A, B and C") or words like "all", "other", "remaining",
-"everything": write one step per object. Fixed
+"everything": write one step per object. If an item names a group ("Assorted glasses"), say in
+"state" how many you need (usually one). Fixed
 furniture (beds, counters, sinks, bathtubs) cannot be moved. Do NOT write steps that only move,
 look, check, search or verify: robots cannot explore, moving between rooms is part of HELP / PASS /
 RECEIVE, and what other robots see is already in their offers.
@@ -178,8 +193,13 @@ Return JSON:
  "reasoning": "which goals matter, which part is mine, what I depend on",
  "goals": [{{"goal": "...", "priority": "high", "in_my_room": true}},
            {{"goal": "...", "priority": "low", "in_my_room": false}}],
+ "checklist": [
+  {{"object": "Glass coffee table", "change": "moved off the workout floor to the wall", "weight": "heavy", "how": "ASK_HELP"}},
+  {{"object": "Red throw pillow", "change": "moved to the sofa", "weight": "light", "how": "LOCAL"}},
+  {{"object": "Glass", "change": "one glass of water beside the workout area", "weight": "light", "how": "RECEIVE"}}
+ ],
  "steps": [
-  {{"type": "RECEIVE", "item": "...", "target": "R1", "enables": 1, "serves": 0}},
+  {{"type": "RECEIVE", "item": "...", "state": "one ..., filled with ...", "target": "R1", "enables": 1, "serves": 0}},
   {{"type": "LOCAL", "action": "move ... from ... to ...", "uses": 0, "serves": 0}},
   {{"type": "ASK_HELP", "action": "move the heavy ... to ...", "target": "R4", "enables": 3, "serves": 1}},
   {{"type": "LOCAL", "action": "...", "uses": 1, "serves": 1}},
@@ -205,7 +225,8 @@ ROBOT PROFILES:
 
 PLAN_FIX = """Your plan violated these rules:
 {errors}
-Fix ONLY these problems and return the full corrected JSON in the same format.
+Fix ONLY these problems and return the full corrected JSON in the same format (including
+"goals" and "checklist").
 - If a step breaks your body's limits but the task still needs it, do NOT delete it: rewrite it as
   ASK_HELP to a robot whose body can do it (keep the step that depends on it).
 - If you are fixed and an object must leave your room, write a PASS (a mobile receiver collects it).
@@ -234,6 +255,9 @@ If you accept or volunteer, you add ONE step to your own plan:
 - for RECEIVE you will add a PASS step: give "item", copied exactly from YOUR has_items.
   If you already OFFERED exactly this item to this robot (a PASS in your plan), just "accept":
   your offer is linked, no second PASS is added.
+  If the request asks for a state ("one glass, filled with drinking water"), your PASS "action" must
+  include preparing it, e.g. "fill one Glass with water at the sink and pass it". Accept only if your
+  body can prepare it.
   PASS includes picking the item up. If you are mobile, you bring it to the requester. If you are
   fixed, you hand it over within your reach and the (mobile) requester collects it.
   Do not add other steps for the handoff.
