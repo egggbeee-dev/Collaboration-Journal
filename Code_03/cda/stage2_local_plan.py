@@ -18,10 +18,10 @@ from .llm import BaseLLM
 from .log import EventLog
 from .prompts import PLAN_FIX, PLAN_USER, _j, indexed, plan_system
 from .schemas import (ASK_HELP, LOCAL, PASS, RECEIVE, REQUEST_TYPES, Node, Offer, TaskConfig,
-                      agent_num, norm, snap_duration)
+                      agent_num, norm)
 
 
-# No exploration in this setting, and movement is added by the scheduler: steps that only look,
+# No exploration in this setting, and movement is part of HELP / PASS / RECEIVE: steps that only look,
 # check or search for something do not change the world and are not allowed.
 _MOVE_ONLY = re.compile(r"^\s*(go|move|walk|head|travel|return|navigate|come)\s+(back\s+)?(to|into)\b", re.I)
 _NON_PHYSICAL = re.compile(r"^\s*(mark|coordinate|conduct|ensure|make sure|confirm|supervise|oversee|monitor|"
@@ -30,16 +30,11 @@ _OBSERVE = re.compile(r"\b(check|checks|checking|search|searching|look for|looki
                       r"inspect|verify|scan|locate|explore|availability)\b", re.I)
 
 
-def _carrier(s: dict, giver: str, receiver: str, cfg: TaskConfig, v: list[str]) -> str | None:
-    """A fixed robot cannot move objects between rooms: a mobile robot (not the giver, not the receiver,
-    who both stay in their rooms) must carry it."""
-    c = str(s.get("carrier") or "").strip().upper()
-    ok = [a.id for a in cfg.agents if a.profile.mobile and a.id not in (giver, receiver)]
-    if c not in ok:
-        v.append(f"{giver} is fixed and cannot send objects to another room, and {receiver} stays in its room: "
-                 f"name a mobile robot to carry it in \"carrier\" (one of {ok}), got {c or None}")
-        return None
-    return c
+def _check_mover(giver: str, receiver: str, cfg: TaskConfig, v: list[str]) -> None:
+    """The object is moved by the mobile end of the handoff. Two fixed robots cannot exchange objects."""
+    if giver in cfg.ids and receiver in cfg.ids and cfg.mover(giver, receiver) is None:
+        v.append(f"{giver} and {receiver} are both fixed: nobody can move an object between their rooms. "
+                 f"Remove this handoff")
 
 
 def validate(raw_steps: list[dict], agent: str, offers: dict[str, Offer], cfg: TaskConfig,
@@ -59,7 +54,6 @@ def validate(raw_steps: list[dict], agent: str, offers: dict[str, Offer], cfg: T
             "target": (str(s["target"]).strip().upper() if s.get("target") else None),
             "uses": s.get("uses"),
             "location": str(s.get("location") or me.profile.room),
-            "duration": snap_duration(s.get("duration", 2)),
         }
         if t not in {LOCAL, PASS} | REQUEST_TYPES:
             errors.append(f"step {i}: type '{t}' is not allowed (use LOCAL, ASK_HELP, RECEIVE, PASS)")
@@ -72,7 +66,7 @@ def validate(raw_steps: list[dict], agent: str, offers: dict[str, Offer], cfg: T
             if not step["item"] or norm(step["item"]) not in {norm(x) for x in own.has_items}:
                 v.append(f"PASS item '{step['item']}' must be copied from YOUR has_items")
             step["action"] = step["action"] or f"pass {step['item']} to {step['target']}"
-            step["carrier"] = _carrier(s, agent, step["target"], cfg, v) if not me.profile.mobile else None
+            _check_mover(agent, step["target"], cfg, v)
 
         if goals is not None:
             sv = s.get("serves")
@@ -99,7 +93,7 @@ def validate(raw_steps: list[dict], agent: str, offers: dict[str, Offer], cfg: T
                      f"work (e.g. heavy furniture), do NOT drop it: write ASK_HELP to a robot that can")
         if t in (LOCAL, ASK_HELP) and (_OBSERVE.search(step["action"]) or _MOVE_ONLY.search(step["action"])):
             v.append(f"{t} '{step['action']}' only looks/checks/searches. Robots cannot explore and "
-                     f"movement is added automatically: write only steps that change the room "
+                     f"movement is part of HELP/PASS/RECEIVE: write only steps that change the room "
                      f"(what the others can see is in their offers)")
         if t == LOCAL:
             u = step["uses"]
@@ -112,7 +106,6 @@ def validate(raw_steps: list[dict], agent: str, offers: dict[str, Offer], cfg: T
             step["location"] = me.profile.room
         elif t in REQUEST_TYPES:
             step["uses"] = None
-            step["basis"] = "dependency"
             tgt = step["target"]
             if tgt not in cfg.ids or tgt == agent:
                 v.append(f"{t} needs a target among {[x for x in cfg.ids if x != agent]}, got {tgt}")
@@ -121,9 +114,7 @@ def validate(raw_steps: list[dict], agent: str, offers: dict[str, Offer], cfg: T
                 v.append("ASK_HELP needs an action")
             if t == RECEIVE:
                 step["location"] = me.profile.room
-                giver = cfg.agent(step["target"]) if step["target"] in cfg.ids else None
-                step["carrier"] = _carrier(s, step["target"], agent, cfg, v) \
-                    if giver is not None and not giver.profile.mobile else None
+                _check_mover(step["target"], agent, cfg, v)
                 if not step["item"]:
                     v.append("RECEIVE needs an item")
                 elif step["target"] in offers and norm(step["item"]) not in \
@@ -222,9 +213,9 @@ async def make_local_plan(cfg: TaskConfig, agent: str, offers: dict[str, Offer],
 
     n = agent_num(agent)
     nodes = [Node(id=f"r{n}_s{k}", agent=agent, type=s["type"], action=s["action"], item=s["item"],
-                  target=s["target"], uses=s["uses"], location=s["location"], duration=s["duration"],
+                  target=s["target"], uses=s["uses"], location=s["location"],
                   origin="offer" if s["type"] == PASS else "local", violations=s["violations"],
-                  serves=s.get("serves"), basis=s.get("basis", "dependency"))
+                  serves=s.get("serves"))
              for k, s in enumerate(steps, start=1)]
     raw_to_id = {s["_raw_index"]: nodes[k].id for k, s in enumerate(steps)}
     for s, node in zip(steps, nodes):
@@ -239,21 +230,6 @@ async def make_local_plan(cfg: TaskConfig, agent: str, offers: dict[str, Offer],
         if node.type in REQUEST_TYPES and node.enables is None:
             node.status = "dropped"
             log.log("plan", agent, "request_withdrawn", node=node.id)
-    # carry requests: owned by whoever started the handoff, asked of the named mobile carrier
-    k = len(nodes)
-    for s, node in list(zip(steps, nodes)):
-        c = s.get("carrier")
-        if not c or node.status != "active":
-            continue
-        giver = agent if node.type == PASS else node.target
-        receiver = node.target if node.type == PASS else agent
-        k += 1
-        nodes.append(Node(id=f"r{n}_s{k}", agent=agent, type=ASK_HELP, basis="carry", carry_for=node.id,
-                          target=c, item=node.item, location=cfg.agent(giver).profile.room, duration=1,
-                          action=f"carry the {node.item} from the {cfg.agent(giver).profile.room} ({giver}) "
-                                 f"to {receiver} in the {cfg.agent(receiver).profile.room}",
-                          origin="local", serves=node.serves))
-        log.log("plan", agent, "carry_request", node=nodes[-1].id, carrier=c, item=node.item)
     log.log("plan", agent, "broadcast_requests", steps=len(nodes),
             requests=sum(x.type in REQUEST_TYPES and x.status == "active" for x in nodes),
             violations=sum(bool(x.violations) for x in nodes))
